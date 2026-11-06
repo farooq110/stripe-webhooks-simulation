@@ -1,0 +1,36 @@
+# This repo only tracks the application code. Everything else in the working
+# folder (dependencies, databases, build output, local tools) stays local.
+# We ignore everything at the root first, then whitelist what the app needs.
+
+/*
+!/.gitignore
+!/.env.example
+!/README.md
+!/SETUP.md
+!/USER_MANUAL.md
+!/setup.sh
+!/package.json
+!/bun.lock
+!/tsconfig.json
+!/next.config.ts
+!/postcss.config.mjs
+!/eslint.config.mjs
+!/components.json
+!/playwright.config.ts
+!/tailwind.config.ts
+!/next-env.d.ts
+!/src/
+!/tests/
+!/public/
+!/scripts/
+
+# sandbox-only helper scripts, not part of the app
+/scripts/gen-ssh-key.py
+/scripts/git-ssh.py
+
+# things that should never ship even if they end up in whitelisted folders
+node_modules
+.env
+*.log
+test-results
+playwright-report
