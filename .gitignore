@@ -27,6 +27,7 @@
 # sandbox-only helper scripts, not part of the app
 /scripts/gen-ssh-key.py
 /scripts/git-ssh.py
+/scripts/dev-daemon.py
 
 # things that should never ship even if they end up in whitelisted folders
 node_modules

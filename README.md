@@ -14,6 +14,7 @@ Pick one of four demo scenarios and watch the whole webhook lifecycle move acros
 | **Payment retry** | A renewal payment fails (402), the subscription goes `past_due`, a smart retry fires 6 seconds later, the payment succeeds and the subscription returns to `active`. |
 | **Duplicate webhook** | The same event is redelivered. The idempotency guard blocks it: zero database writes, and the endpoint still answers 200 so Stripe stops retrying. |
 | **DB failure + recovery** | A failure switch makes the database transaction blow up, the endpoint returns 500, redeliveries queue up with exponential backoff, and when an operator turns the switch off, the next redelivery succeeds. |
+| **Cancel subscription** | A cancel button on any live subscription emits `customer.subscription.deleted` through the real signed pipeline; the transaction flips it to `canceled`. |
 
 Three ways to watch a run:
 
@@ -45,12 +46,13 @@ Need more detail? See [SETUP.md](SETUP.md) for setup options and [USER_MANUAL.md
 The backend was verified with 52 API integration assertions and the frontend with 11 Playwright end-to-end tests:
 
 ```bash
-node scripts/api-tests.mjs     # 52 assertions: signatures, all 4 scenarios, idempotency, recovery
-npx playwright test            # 11 e2e tests through the real UI
-node scripts/mongo-smoke.mjs   # transaction smoke test (abort rollback + commit + indexes)
+node scripts/api-tests.mjs          # 52 assertions: signatures, all scenarios, idempotency, recovery
+node scripts/reliability-tests.mjs  # 26 checks: concurrency race, stale events, crash recovery, retry limits
+npx playwright test                 # 11 e2e tests through the real UI
+node scripts/mongo-smoke.mjs        # transaction smoke test (abort rollback + commit + indexes)
 ```
 
-Both test suites need the app running (`npm run dev` in another terminal), and Playwright needs `npx playwright install` once.
+Both webhook test scripts need `STRIPE_SIM_WEBHOOK_SECRET` set in your `.env` (the server and the script must sign with the same secret). e2e tests need `npx playwright install` once.
 
 ## Live Stripe mode (optional)
 
@@ -67,7 +69,7 @@ By default the app uses the built-in simulator, so no Stripe account is needed. 
    stripe listen --forward-to localhost:3000/api/webhooks/stripe
    ```
 
-Honest note: the simulator path is fully tested (all 63 checks listed above ran against it). The live Stripe path is implemented and compiles, but was not exercised end-to-end because no test key was available in the development environment. Treat it as working-but-unverified until you run it with your own key.
+Honest note: the simulator path is fully tested (all 89 automated checks listed above ran against it). The live Stripe path is implemented and the production build passes type checking, but it was not exercised end-to-end because no test key was available in the development environment. Treat it as working-but-unverified until you run it with your own key.
 
 ## Project layout
 

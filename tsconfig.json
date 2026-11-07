@@ -37,6 +37,15 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "skills",
+    "scripts",
+    "examples",
+    "mini-services",
+    ".mongodb-runtime",
+    "db",
+    "download",
+    "upload",
+    "test-results"
   ]
 }

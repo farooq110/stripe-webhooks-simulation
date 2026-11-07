@@ -2,10 +2,26 @@
 // Implements the exact scheme Stripe uses:
 //   Stripe-Signature: t=<unix_seconds>,v1=<hex_hmac_sha256(secret, `${t}.${payload}`)>
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
-const WEBHOOK_SECRET =
-  process.env.STRIPE_SIM_WEBHOOK_SECRET || 'whsec_sim_5f4dcc3b5aa765d61d8327deb882cf99';
+// No hardcoded default: a secret baked into a public repo is not a secret.
+// If STRIPE_SIM_WEBHOOK_SECRET is set we use it; otherwise we generate one
+// that is unique to this server process and lives only in memory. The sim
+// dispatcher signs with the same value, so delivery and verification always
+// agree inside one process — but nobody outside can forge payloads with a
+// value copied from the repository.
+const globalStore = globalThis as unknown as { __sp_sim_secret?: string };
+
+function resolveSecret(): string {
+  const fromEnv = process.env.STRIPE_SIM_WEBHOOK_SECRET;
+  if (fromEnv) return fromEnv;
+  if (!globalStore.__sp_sim_secret) {
+    globalStore.__sp_sim_secret = `whsec_sim_${randomBytes(32).toString('hex')}`;
+  }
+  return globalStore.__sp_sim_secret;
+}
+
+const WEBHOOK_SECRET = resolveSecret();
 
 export function webhookSecret(): string {
   return WEBHOOK_SECRET;

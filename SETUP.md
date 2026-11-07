@@ -73,18 +73,24 @@ All of these are optional. Copy `.env.example` to `.env` and change what you nee
 | `STRIPE_GATEWAY_MODE` | `sim` | Force a gateway. `sim` = built-in simulator, `live` = real Stripe SDK (requires a secret key). |
 | `STRIPE_SECRET_KEY` | — | Stripe test key. If set and it starts with `sk_test_`, live mode turns on automatically. |
 | `STRIPE_WEBHOOK_SECRET` | — | Signing secret for live webhook verification (the `whsec_...` from `stripe listen`). |
-| `STRIPE_SIM_WEBHOOK_SECRET` | `whsec_sim_...` | Signing secret used by the simulator. Any random string works. |
+| `STRIPE_SIM_WEBHOOK_SECRET` | random per start | Signing secret used by the simulator. If you leave it empty the app generates a random one each start — safe, but you can't sign test webhooks from scripts. Set your own random value (e.g. `openssl rand -hex 32`) to run `scripts/api-tests.mjs` and `scripts/reliability-tests.mjs`. |
 | `APP_URL` | `http://127.0.0.1:3000` | Used for checkout success/cancel redirect URLs. |
+| `DEMO_API_TOKEN` | — | Optional. If set, every `/api/demo/*` endpoint requires the header `x-demo-token: <value>`. Use this on public deployments; the dashboard buttons will then only work for scripts that send the header. |
+| `MAX_PAYMENT_RETRIES` | `3` | How many smart-retry attempts before the subscription is marked `unpaid`. |
 
 Note: the MongoDB connection is hardcoded to `127.0.0.1:27017` (database name `stripepulse`, replica set `rs0`) — see the top of `src/lib/stripepulse/mongo.ts`. Change it there if you need a different host.
 
 ## Verify the install
 
 ```bash
-npm run lint            # should pass with no errors
-node scripts/api-tests.mjs   # 52 backend assertions (app must be running)
+npm run lint                 # should pass with no errors
+npm run build                # production build, type checking on
+bash scripts/run-with-server.sh node scripts/api-tests.mjs    # 52 assertions
+bash scripts/run-with-server.sh node scripts/reliability-tests.mjs  # 26 reliability checks
 npx playwright test          # 11 UI tests (app must be running; first time: npx playwright install)
 ```
+
+`run-with-server.sh` starts MongoDB and the dev server for you if they aren't running yet.
 
 ## Troubleshooting
 
@@ -102,3 +108,9 @@ Either point the app at your existing MongoDB (edit `MONGO_PORT` in `mongo.ts`) 
 
 **Playwright browsers missing**
 Run `npx playwright install` once, then `npx playwright test` again.
+
+**401 responses on dashboard buttons**
+This deployment has `DEMO_API_TOKEN` set. Either send the header from scripts or remove the variable from `.env` and restart.
+
+**429 Too Many Requests**
+Demo endpoints are rate limited per IP (reset: 5/minute, scenarios: 20/minute). Wait a minute.

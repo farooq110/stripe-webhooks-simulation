@@ -4,11 +4,16 @@
 //  2. Idempotency via the unique index on webhook_events.eventId — a
 //     redelivered event that was already processed is acknowledged with 200
 //     but executes ZERO writes.
-//  3. Atomic multi-document writes inside a genuine MongoDB replica-set
+//  3. Concurrency safety: processing a claimed event is reserved to exactly
+//     one request. Parallel deliveries of the same new event wait for the
+//     winner and mirror its outcome instead of racing it (QA finding BUG-1).
+//  4. Atomic multi-document writes inside a genuine MongoDB replica-set
 //     transaction; any failure aborts and rolls back everything.
-//  4. On processing failure the endpoint responds 500 exactly like Stripe
+//  5. On processing failure the endpoint responds 500 exactly like Stripe
 //     expects, and the event is queued for redelivery with exponential
 //     backoff (handled by the scheduler).
+//  6. Stale events (created well before the subscription's last update) are
+//     recorded but cannot drag newer subscription state backwards (BUG-2).
 
 import type { Db, ClientSession, WithTransactionCallback, Document } from 'mongodb';
 import { collections, getDb, getFlag } from './mongo';
@@ -50,6 +55,33 @@ function subPeriods(obj: Record<string, unknown>): { start: string; end: string 
   const toIso = (v: unknown) =>
     typeof v === 'number' ? new Date(v * 1000).toISOString() : new Date().toISOString();
   return { start: toIso(obj.current_period_start), end: toIso(obj.current_period_end) };
+}
+
+// Deliveries can be delayed legitimately (backoff, redelivery, network). But
+// an event created noticeably BEFORE the subscription's last update is history
+// replayed out of order — applying it would drag newer state backwards.
+// 20s comfortably exceeds every legitimate in-app delay (delivery is ≤ a few
+// seconds even with scheduler ticks), while QA's stale repro is 3600s old.
+const STALE_EVENT_SKEW_MS = 20_000;
+
+function eventCreatedMs(event: StripeEvent): number {
+  const created = (event as { created?: number }).created;
+  return typeof created === 'number' ? created * 1000 : Date.now();
+}
+
+async function isStaleForSubscription(
+  db: Db,
+  session: ClientSession,
+  subscriptionId: string | undefined,
+  event: StripeEvent,
+): Promise<boolean> {
+  if (!subscriptionId) return false;
+  const sub = await collections(db).subscriptions.findOne(
+    { subscriptionId } as { subscriptionId: string },
+    { session, projection: { updatedAt: 1 } },
+  );
+  if (!sub?.updatedAt) return false;
+  return Date.parse(sub.updatedAt) - eventCreatedMs(event) > STALE_EVENT_SKEW_MS;
 }
 
 async function handleEvent(
@@ -121,6 +153,17 @@ async function handleEvent(
         : (obj.status as string) ?? 'active';
       const periods = subPeriods(obj);
       const now = new Date().toISOString();
+
+      // Stale guard: an out-of-order event must not overwrite newer state.
+      if (await isStaleForSubscription(db, session, subscriptionId, event)) {
+        ops.push({
+          operation: 'skip',
+          collection: 'subscriptions',
+          detail: `${subscriptionId} · stale event ignored (created ${eventCreatedMs(event) > 0 ? new Date(eventCreatedMs(event)).toISOString() : '?'} < last update) · status stays untouched`,
+        });
+        break;
+      }
+
       const canceledAt = status === 'canceled' ? now : undefined;
       const set: Record<string, unknown> = {
         runId,
@@ -174,7 +217,7 @@ async function handleEvent(
                   'Your card was declined.',
               }),
           createdAt: now,
-        } as Document,
+        },
         { session },
       );
       ops.push({
@@ -186,6 +229,18 @@ async function handleEvent(
       const periodEnd = typeof obj.period_end === 'number'
         ? new Date(obj.period_end * 1000).toISOString()
         : new Date(Date.now() + 30 * 86_400_000).toISOString();
+
+      // Stale guard first: an old payment event must not flip a subscription
+      // that has already moved on (e.g. recovered to active) back to past_due.
+      if (await isStaleForSubscription(db, session, subscriptionId, event)) {
+        ops.push({
+          operation: 'skip',
+          collection: 'subscriptions',
+          detail: `${subscriptionId} · stale ${event.type} ignored · status left untouched`,
+        });
+        break;
+      }
+
       const nextStatus = paid ? 'active' : 'past_due';
       await c.subscriptions.updateOne(
         { subscriptionId } as { subscriptionId: string },
@@ -216,6 +271,144 @@ async function handleEvent(
       });
       break;
   }
+}
+
+// ── Duplicate acknowledgement ────────────────────────────────────────────────
+// Shared by the direct-duplicate path and the sibling-mirror path: answer 200,
+// record the blocked delivery, execute zero writes.
+async function acknowledgeDuplicate(
+  db: Db,
+  event: StripeEvent,
+  runId: string | undefined,
+  t0: number,
+  via?: 'sibling-wait',
+): Promise<ProcessResult> {
+  const c = collections(db);
+  const now = new Date().toISOString();
+  await c.events.updateOne(
+    { eventId: event.id } as { eventId: string },
+    {
+      $push: { deliveries: { at: now, httpStatus: 200, duplicate: true } },
+      $set: { status: 'duplicate' },
+    },
+  );
+  await logDb({
+    runId,
+    operation: 'findUnique',
+    collection: 'webhook_events',
+    detail: `idempotency guard: ${event.id} already processed — blocked redelivery, 0 writes`,
+    result: 'read-only',
+    transaction: false,
+  });
+  await logApi({
+    runId,
+    direction: 'inbound',
+    component: 'app webhook endpoint',
+    method: 'POST',
+    path: WEBHOOK_PATH,
+    statusCode: 200,
+    durationMs: Date.now() - t0,
+    request: {
+      eventId: event.id,
+      type: event.type,
+      redelivery: true,
+      ...(via ? { via } : {}),
+    },
+    response: { received: true, duplicate: true, writesExecuted: 0 },
+  });
+  if (runId) {
+    await completeStep(runId, 'dedup_check', {
+      result: 'duplicate blocked',
+      eventId: event.id,
+      guard: 'unique index webhook_events.eventId',
+    });
+  }
+  return {
+    httpStatus: 200,
+    body: {
+      received: true,
+      duplicate: true,
+      signatureVerified: true,
+      eventId: event.id,
+      writesExecuted: 0,
+    },
+  };
+}
+
+// A concurrent delivery of an event another worker is processing right now.
+// Wait for that worker's outcome and mirror it: 200 duplicate when it commits,
+// 500 when it fails (so a real Stripe would redeliver), 200 concurrent if it
+// takes too long — the scheduler still owns the event either way.
+const SIBLING_WAIT_MS = 12_000;
+
+async function waitForSiblingOutcome(
+  db: Db,
+  event: StripeEvent,
+  runId: string | undefined,
+  t0: number,
+): Promise<ProcessResult> {
+  const c = collections(db);
+  const deadline = Date.now() + SIBLING_WAIT_MS;
+
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 300));
+    const doc = await c.events.findOne(
+      { eventId: event.id } as { eventId: string },
+      { projection: { status: 1, lastError: 1, nextRetryAt: 1 } },
+    );
+    if (!doc) continue;
+    if (doc.status === 'processed' || doc.status === 'duplicate') {
+      return acknowledgeDuplicate(db, event, runId, t0, 'sibling-wait');
+    }
+    if (doc.status === 'failed') {
+      await c.events.updateOne(
+        { eventId: event.id } as { eventId: string },
+        { $push: { deliveries: { at: new Date().toISOString(), httpStatus: 500, duplicate: false, mirrored: true } } },
+      );
+      await logApi({
+        runId,
+        direction: 'inbound',
+        component: 'app webhook endpoint',
+        method: 'POST',
+        path: WEBHOOK_PATH,
+        statusCode: 500,
+        durationMs: Date.now() - t0,
+        request: { eventId: event.id, type: event.type, mirrored: true },
+        response: { error: doc.lastError ?? 'processing failed in another worker', mirrored: true },
+      });
+      return {
+        httpStatus: 500,
+        body: {
+          error: doc.lastError ?? 'Processing failed in another worker',
+          eventId: event.id,
+          nextRetryAt: doc.nextRetryAt,
+          mirrored: true,
+        },
+      };
+    }
+  }
+
+  await logApi({
+    runId,
+    direction: 'inbound',
+    component: 'app webhook endpoint',
+    method: 'POST',
+    path: WEBHOOK_PATH,
+    statusCode: 200,
+    durationMs: Date.now() - t0,
+    request: { eventId: event.id, type: event.type, concurrent: true },
+    response: { received: true, concurrent: true, writesExecuted: 0 },
+  });
+  return {
+    httpStatus: 200,
+    body: {
+      received: true,
+      concurrent: true,
+      eventId: event.id,
+      writesExecuted: 0,
+      note: 'another worker holds the claim; scheduler owns the outcome',
+    },
+  };
 }
 
 export async function processWebhook(
@@ -264,10 +457,22 @@ export async function processWebhook(
   const runId = ((event.data.object as Record<string, unknown>).metadata as Record<string, string>)
     ?.run_id ?? undefined;
 
-  // ── 2 · Idempotency guard (unique index on eventId) ──────────────────────
+  // ── 2 · Atomic claim (idempotency + concurrency safety, QA BUG-1) ────────
+  // Exactly one request may process a given event:
+  //   · a NEW event is claimed by inserting its row — the unique index turns
+  //     any race into exactly one winner plus E11000 losers;
+  //   · a REDELIVERY is claimed by flipping a finished/stale row back to
+  //     'processing' with findOneAndUpdate — atomic, so two concurrent
+  //     redeliveries cannot both win;
+  //   · a delivery arriving while another worker still holds a live claim
+  //     waits for that worker's outcome and mirrors it. It never processes in
+  //     parallel, so the event can no longer be corrupted by the race.
+  const CLAIM_TTL_MS = 30_000;
   const now = new Date().toISOString();
+  const claimExpiresAt = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
   let attempts = 1;
   let isRetry = false;
+
   try {
     await c.events.insertOne({
       _id: event.id,
@@ -275,74 +480,59 @@ export async function processWebhook(
       runId,
       type: event.type,
       payloadRaw: raw,
-      status: 'received',
+      status: 'processing',
       attempts: 1,
       signatureVerified: true,
       deliveries: [],
+      claimExpiresAt,
       createdAt: now,
-    } as Document);
+    });
+    // We hold the fresh claim — fall through and process.
   } catch (e) {
     const code = (e as { code?: number }).code;
     if (code !== 11000) throw e;
-    // Event already known — decide duplicate vs. legitimate retry.
+
+    // Event already known — duplicate, legitimate retry, or concurrent sibling.
     const existing = await c.events.findOne({ eventId: event.id } as { eventId: string });
     if (!existing) {
       // Extremely rare: duplicate key but doc vanished. Retry insert once.
       return processWebhook(raw, signature);
     }
+
     if (existing.status === 'processed' || existing.status === 'duplicate') {
       // ── DUPLICATE: acknowledge, execute zero writes ──────────────────────
-      await c.events.updateOne(
-        { eventId: event.id } as { eventId: string },
-        { $push: { deliveries: { at: now, httpStatus: 200, duplicate: true } }, $set: { status: 'duplicate' } },
-      );
-      await logDb({
-        runId,
-        operation: 'findUnique',
-        collection: 'webhook_events',
-        detail: `idempotency guard: ${event.id} already processed — blocked redelivery, 0 writes`,
-        result: 'read-only',
-        transaction: false,
-      });
-      await logApi({
-        runId,
-        direction: 'inbound',
-        component: 'app webhook endpoint',
-        method: 'POST',
-        path: WEBHOOK_PATH,
-        statusCode: 200,
-        durationMs: Date.now() - t0,
-        request: { eventId: event.id, type: event.type, redelivery: true },
-        response: { received: true, duplicate: true, writesExecuted: 0 },
-      });
-      if (runId) {
-        await completeStep(runId, 'dedup_check', {
-          result: 'duplicate blocked',
-          eventId: event.id,
-          guard: 'unique index webhook_events.eventId',
-        });
-      }
-      return {
-        httpStatus: 200,
-        body: {
-          received: true,
-          duplicate: true,
-          signatureVerified: true,
-          eventId: event.id,
-          writesExecuted: 0,
-        },
-      };
+      return acknowledgeDuplicate(db, event, runId, t0);
     }
-    // status 'failed' or stale 'received': this is a legitimate redelivery retry
-    isRetry = true;
-    attempts = existing.attempts + 1;
-    await c.events.updateOne(
-      { eventId: event.id } as { eventId: string },
+
+    if (existing.status === 'processing' && (existing.claimExpiresAt ?? '') > now) {
+      // A live claim is held elsewhere — wait and mirror, never race.
+      return waitForSiblingOutcome(db, event, runId, t0);
+    }
+
+    // Reclaimable: 'failed' (legitimate retry), legacy 'received' rows, or a
+    // claim that expired because a worker died mid-processing.
+    const reclaimed = await c.events.findOneAndUpdate(
       {
-        $set: { status: 'processing', lastError: undefined, nextRetryAt: undefined },
+        eventId: event.id,
+        $or: [
+          { status: 'failed' },
+          { status: 'received' },
+          { status: 'processing', claimExpiresAt: { $lte: now } },
+        ],
+      } as Document,
+      {
+        $set: { status: 'processing', claimExpiresAt },
+        $unset: { lastError: '', nextRetryAt: '' },
         $inc: { attempts: 1 },
-      },
+      } as Document,
+      { returnDocument: 'after' },
     );
+    if (!reclaimed) {
+      // Lost the reclaim race — a sibling claimed it between read and update.
+      return waitForSiblingOutcome(db, event, runId, t0);
+    }
+    isRetry = true;
+    attempts = (reclaimed.attempts as number) ?? attempts + 1;
   }
 
   // ── 3 · Atomic processing (real MongoDB transaction) ─────────────────────

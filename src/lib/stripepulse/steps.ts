@@ -59,4 +59,12 @@ export const STEP_PLANS: Record<string, StepPlan[]> = {
     { key: 'subscription_updated', title: 'Subscription updated', nodeId: 'subscription' },
     { key: 'ui_refresh', title: 'Dashboard refreshed via polling', nodeId: 'dashboard' },
   ],
+  cancel_subscription: [
+    { key: 'cancel_requested', title: 'Operator requested cancellation', nodeId: 'subscription' },
+    { key: 'webhook_delivery', title: 'customer.subscription.deleted delivered', nodeId: 'webhook' },
+    { key: 'signature_verified', title: 'Webhook signature verified', nodeId: 'signature' },
+    { key: 'dedup_check', title: 'Idempotency guard passed', nodeId: 'dedup' },
+    { key: 'db_transaction', title: 'Subscription → canceled committed (ACID)', nodeId: 'db' },
+    { key: 'ui_refresh', title: 'Dashboard refreshed via polling', nodeId: 'dashboard' },
+  ],
 };

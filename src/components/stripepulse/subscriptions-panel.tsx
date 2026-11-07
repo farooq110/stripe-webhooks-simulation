@@ -1,9 +1,12 @@
 'use client';
 
-import { ArrowRight, CheckCircle2, Clock, XCircle } from 'lucide-react';
+import { useState } from 'react';
+import { ArrowRight, CheckCircle2, Clock, XCircle, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { useToast } from '@/hooks/use-toast';
 import type { AppStatePayload, RunStatePayload, SubscriptionDoc } from '@/lib/stripepulse/types';
 import { cn } from '@/lib/utils';
 
@@ -11,6 +14,7 @@ const LIFECYCLE: { status: SubscriptionDoc['status']; label: string }[] = [
   { status: 'trialing', label: 'trialing' },
   { status: 'active', label: 'active' },
   { status: 'past_due', label: 'past_due' },
+  { status: 'unpaid', label: 'unpaid' },
   { status: 'canceled', label: 'canceled' },
 ];
 
@@ -31,10 +35,37 @@ export function SubscriptionsPanel({
   run: RunStatePayload | null;
   appState: AppStatePayload | null;
 }) {
+  const { toast } = useToast();
+  const [canceling, setCanceling] = useState<string | null>(null);
   const subs: SubscriptionDoc[] = run?.subscriptions?.length
     ? run.subscriptions
     : appState?.subscriptions ?? [];
   const currentStatus = subs[0]?.status;
+
+  const cancel = async (subscriptionId: string) => {
+    setCanceling(subscriptionId);
+    try {
+      const res = await fetch('/api/demo/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscriptionId }),
+      });
+      const json = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+      toast({
+        title: 'Cancellation delivered',
+        description: `${subscriptionId} → customer.subscription.deleted is being processed.`,
+      });
+    } catch (e) {
+      toast({
+        title: 'Cancellation failed',
+        description: e instanceof Error ? e.message : String(e),
+        variant: 'destructive',
+      });
+    } finally {
+      setCanceling(null);
+    }
+  };
 
   return (
     <div className="space-y-3" data-testid="subscriptions-panel">
@@ -99,6 +130,19 @@ export function SubscriptionsPanel({
                     renews {new Date(s.currentPeriodEnd).toLocaleDateString()}
                   </div>
                 </div>
+                {(s.status === 'active' || s.status === 'trialing' || s.status === 'past_due') && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 shrink-0 px-2 text-[10px] text-muted-foreground hover:text-rose-500"
+                    disabled={canceling !== null}
+                    onClick={() => void cancel(s.subscriptionId)}
+                    data-testid={`cancel-sub-${s.subscriptionId}`}
+                  >
+                    <X className="h-3 w-3" />
+                    {canceling === s.subscriptionId ? 'Canceling…' : 'Cancel'}
+                  </Button>
+                )}
               </CardContent>
             </Card>
           ))}

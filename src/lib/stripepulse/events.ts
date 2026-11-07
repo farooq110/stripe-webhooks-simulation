@@ -16,7 +16,7 @@ export function buildEvent(type: string, object: Record<string, unknown>): Promi
   }));
 }
 
-interface SubMeta {
+export interface SubMeta {
   runId: string;
   subscriptionId: string;
   customerId: string;
@@ -27,7 +27,7 @@ interface SubMeta {
   currency: string;
 }
 
-function subFields(m: SubMeta, status: string, periodStartIso: string, periodEndIso: string) {
+export function subFields(m: SubMeta, status: string, periodStartIso: string, periodEndIso: string) {
   return {
     id: m.subscriptionId,
     object: 'subscription',
@@ -94,6 +94,16 @@ export function subscriptionCreated(m: SubMeta, trialDays: number) {
 export function subscriptionUpdated(m: SubMeta, status: string, periodEndIso: string) {
   const start = new Date().toISOString();
   return buildEvent('customer.subscription.updated', subFields(m, status, start, periodEndIso));
+}
+
+export function subscriptionDeleted(m: SubMeta, periodStartIso: string, periodEndIso: string) {
+  const base = subFields(m, 'canceled', periodStartIso, periodEndIso);
+  return buildEvent('customer.subscription.deleted', {
+    ...base,
+    cancel_at_period_end: false,
+    canceled_at: Math.floor(Date.now() / 1000),
+    ended_at: Math.floor(Date.now() / 1000),
+  });
 }
 
 export function invoiceObject(m: SubMeta, opts: {

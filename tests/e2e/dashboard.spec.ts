@@ -107,8 +107,13 @@ test.describe.serial('StripePulse dashboard', () => {
 
   test('playhead clamps to the backend-produced frontier', async ({ page }) => {
     await page.goto('/');
-    // Start a fresh run from the UI — the dashboard auto-selects it at playhead 0
+    // Start a fresh run from the UI — the dashboard auto-selects it at playhead 0.
+    // QA finding BUG-8: the completed badge of the PREVIOUS run matches this
+    // assertion before the new run even exists, so first wait for the new
+    // run's step plan to appear (payment_retry plans 13 steps, checkout plans
+    // 10 — a '/13' counter proves the new run is the one being displayed).
     await page.getByTestId('scenario-payment_retry').click();
+    await expect(page.getByTestId('step-counter')).toContainText('/13', { timeout: 45_000 });
     await expect(page.getByTestId('run-status-badge')).toHaveText('completed', { timeout: 45_000 });
 
     await page.getByTestId('mode-manual').click();
@@ -121,9 +126,7 @@ test.describe.serial('StripePulse dashboard', () => {
       await page.getByTestId('btn-next').click();
     }
     // …the playhead stops exactly at the frontier the backend produced
-    // (payment_retry plans 13 steps; a setup checkout may add runs but not steps)
-    const counter = await page.getByTestId('step-counter').textContent();
-    expect(counter).toMatch(/^step 13\/13$/);
+    await expect(page.getByTestId('step-counter')).toHaveText(/^step 13\/13$/, { timeout: 10_000 });
     await expect(page.getByTestId('btn-next')).toBeDisabled();
   });
 

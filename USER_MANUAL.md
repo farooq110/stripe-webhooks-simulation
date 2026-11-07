@@ -41,6 +41,8 @@ In the left rail, pick a plan (Starter or Pro) and click one of the four scenari
 
 **DB failure → recovery** — arms a failure switch, then delivers a `customer.subscription.updated` event. The transaction fails, the endpoint returns 500, and the event goes into the retry queue with exponential backoff. Redeliveries keep failing while the switch is on. Turn the switch off (the red **failure injection** toggle in the left rail) and the next redelivery succeeds — the whole recovery trace is recorded: 500 → retries → 200.
 
+**Cancel subscription** — click **Cancel** on any live subscription card (right panel). The app emits a real `customer.subscription.deleted` event through the signed pipeline and the transaction flips the subscription to `canceled`. The lifecycle strip and the run history show the whole path.
+
 ## 3. Animation modes
 
 Under the pipeline there's a mode selector with three options:
@@ -77,7 +79,9 @@ Newest entries appear on top. Each row expands to full JSON.
 
 - **Stat cards** — Active subs, MRR, Events ok (events processed), Dup blocked (duplicates caught). These come from real collections, not counters in the UI.
 - **Plan selector** — which plan the checkout scenario uses (changes the amounts you'll see).
-- **Failure injection toggle** — arms/disarms the database failure used by the "DB failure → recovery" scenario. When it's armed, the card turns red. This is also your "operator action" during that scenario: redeliveries fail while it's on; turn it off to let the next retry succeed.
+- **Failure injection toggles** — two switches:
+  - **DB write failure** — arms/disarms the database failure used by the "DB failure → recovery" scenario. When armed, the card turns red. This is also your "operator action" during that scenario: redeliveries fail while it's on; turn it off to let the next retry succeed.
+  - **Retry declines** — makes the simulated card network decline every smart retry. With it on, a payment-retry run burns through its attempt limit and ends with the subscription in the `unpaid` terminal state — that's how you see dunning fail for real.
 - **Retry tick** — manually nudges the scheduler instead of waiting for its next tick. Useful when you're impatient during the retry scenarios.
 - **Reset demo environment** — wipes runs, events, subscriptions and logs from MongoDB and starts clean. Doesn't touch the plans.
 
@@ -85,7 +89,7 @@ Newest entries appear on top. Each row expands to full JSON.
 
 The right side shows the two tables that matter for subscription state:
 
-- **Subscriptions** — one row per subscription: customer, plan, status (`trialing`, `active`, `past_due`, `canceled`), current period. Status changes are the visible result of the webhook transactions.
+- **Subscriptions** — one row per subscription: customer, plan, status (`trialing`, `active`, `past_due`, `unpaid`, `canceled`), current period, and a **Cancel** button for live subscriptions. Status changes are the visible result of the webhook transactions.
 - **Payment attempts** — one row per charge attempt, successful or not, with the decline reason when there is one. In the retry scenario you'll see attempt #1 with `card_declined` and attempt #2 succeeded.
 
 ## 7. Run history
@@ -105,7 +109,8 @@ The app exposes:
 | --- | --- |
 | `GET /api/health` | MongoDB status, gateway mode, version. Use this in scripts to check the app is alive. |
 | `POST /api/webhooks/stripe` | The webhook receiver. Verifies signatures, dedups events, runs transactions. |
-| `POST /api/demo/checkout`, `/api/demo/payment-retry`, `/api/demo/duplicate`, `/api/demo/db-failure` | Start each scenario. |
+| `POST /api/demo/checkout`, `/api/demo/scenarios/payment-retry`, `/api/demo/scenarios/duplicate`, `/api/demo/scenarios/db-failure` | Start each scenario. |
+| `POST /api/demo/cancel` | Cancel a subscription through the real pipeline. |
 | `POST /api/demo/flags` | Turn failure injection on/off. |
 | `POST /api/demo/tick` | Force a scheduler tick. |
 | `POST /api/demo/reset` | Wipe the demo environment. |
@@ -118,3 +123,7 @@ The app exposes:
 - Speed changes affect only animation. The backend runs at its own pace; that's why pausing animation never pauses the system.
 - The playhead can lag behind reality (that's normal in auto mode at 0.5x) but can never run ahead of it.
 - All money amounts are test-mode cents. Nothing here can move real money.
+- Out-of-order protection: an event that was created well before the subscription's last update is recorded but cannot drag the status backwards. A 1-hour-old "payment failed" event cannot flip an active subscription to past_due.
+- Concurrency protection: if the same event arrives many times at the same moment, exactly one delivery processes it and the others wait and mirror the result — no double charges, no corrupted state.
+- Rate limits: demo endpoints accept a limited number of requests per minute per IP (reset: 5, scenarios: 20). On a public deployment the operator can additionally require a shared token — see SETUP.md.
+- The simulator's webhook signing secret is generated randomly per start unless you set `STRIPE_SIM_WEBHOOK_SECRET` in `.env`. No secret is shipped in the code.

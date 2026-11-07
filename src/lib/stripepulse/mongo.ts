@@ -114,7 +114,7 @@ async function ensureSchema(db: Db): Promise<void> {
   await db.collection('retry_jobs').createIndex({ status: 1, nextRetryAt: 1 });
 
   // Seed plans (idempotent)
-  const plans = db.collection('plans');
+  const plans = collections(db).plans;
   const count = await plans.countDocuments();
   if (count === 0) {
     await plans.insertMany([
@@ -123,8 +123,9 @@ async function ensureSchema(db: Db): Promise<void> {
       { _id: 'price_enterprise_monthly', planName: 'Enterprise', amount: 9900, currency: 'usd', interval: 'month' },
     ]);
   }
-  // Default flags
-  await db.collection('flags').updateOne(
+  // Default flags (string ids, same as plans)
+  const flags = collections(db).flags;
+  await flags.updateOne(
     { _id: 'db_failure' },
     { $setOnInsert: { enabled: false, updatedAt: new Date().toISOString() } },
     { upsert: true },
@@ -162,7 +163,8 @@ export async function mongoHealth(): Promise<{ ok: boolean; version?: string; er
 /** Atomic counter for deterministic Stripe-style object ids. */
 export async function nextSeq(name: string): Promise<number> {
   const db = await getDb();
-  const r = await db.collection('counters').findOneAndUpdate(
+  const counters = collections(db).counters;
+  const r = await counters.findOneAndUpdate(
     { _id: name },
     { $inc: { seq: 1 } },
     { upsert: true, returnDocument: 'after' },
@@ -172,32 +174,55 @@ export async function nextSeq(name: string): Promise<number> {
 
 export async function getFlag(name: string): Promise<boolean> {
   const db = await getDb();
-  const doc = await db.collection('flags').findOne({ _id: name } as { _id: string });
-  return Boolean((doc as { enabled?: boolean } | null)?.enabled);
+  const flags = db.collection<{ _id: string; enabled: boolean; updatedAt: string }>('flags');
+  const doc = await flags.findOne({ _id: name });
+  return Boolean(doc?.enabled);
 }
 
 export async function setFlag(name: string, enabled: boolean): Promise<void> {
   const db = await getDb();
-  await db.collection('flags').updateOne(
-    { _id: name } as { _id: string },
+  const flags = db.collection<{ _id: string; enabled: boolean; updatedAt: string }>('flags');
+  await flags.updateOne(
+    { _id: name },
     { $set: { enabled, updatedAt: new Date().toISOString() } },
     { upsert: true },
   );
 }
 
+/** Shape of a webhook_events row — typed so update filters/operators check. */
+export interface EventRecord {
+  _id: string;
+  eventId: string;
+  runId?: string;
+  type: string;
+  payloadRaw: string;
+  status: 'processing' | 'processed' | 'failed' | 'duplicate' | 'received';
+  attempts: number;
+  signatureVerified: boolean;
+  deliveries: { at: string; httpStatus: number; duplicate: boolean; mirrored?: boolean }[];
+  claimExpiresAt?: string;
+  lastError?: string;
+  nextRetryAt?: string;
+  processedAt?: string;
+  createdAt: string;
+}
+
+/** Every domain collection uses string ids (run_x, evt_x, in_x…), never ObjectId. */
+type StrDoc = { _id: string } & Record<string, any>;
+
 export function collections(db: Db) {
   return {
-    runs: db.collection('runs'),
-    steps: db.collection('run_steps'),
-    events: db.collection('webhook_events'),
-    apiLogs: db.collection('api_logs'),
-    dbLogs: db.collection('db_logs'),
-    attempts: db.collection('payment_attempts'),
-    subscriptions: db.collection('subscriptions'),
-    customers: db.collection('customers'),
-    retryJobs: db.collection('retry_jobs'),
-    plans: db.collection('plans'),
-    flags: db.collection('flags'),
-    counters: db.collection('counters'),
+    runs: db.collection<StrDoc>('runs'),
+    steps: db.collection<StrDoc>('run_steps'),
+    events: db.collection<EventRecord>('webhook_events'),
+    apiLogs: db.collection<StrDoc>('api_logs'),
+    dbLogs: db.collection<StrDoc>('db_logs'),
+    attempts: db.collection<StrDoc>('payment_attempts'),
+    subscriptions: db.collection<StrDoc>('subscriptions'),
+    customers: db.collection<StrDoc>('customers'),
+    retryJobs: db.collection<StrDoc>('retry_jobs'),
+    plans: db.collection<{ _id: string; planName: string; amount: number; currency: string; interval: string }>('plans'),
+    flags: db.collection<{ _id: string; enabled: boolean; updatedAt: string }>('flags'),
+    counters: db.collection<{ _id: string; seq: number }>('counters'),
   };
 }

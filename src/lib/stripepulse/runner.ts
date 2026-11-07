@@ -20,6 +20,7 @@ import {
   paymentIntentSucceeded,
   subMetaFromSession,
   subscriptionCreated,
+  subscriptionDeleted,
   subscriptionUpdated,
   type SubMeta,
 } from './events';
@@ -163,7 +164,7 @@ export async function startCheckoutRun(input: {
 export async function confirmCheckout(runId: string): Promise<{ ok: boolean; error?: string }> {
   const db = await getDb();
   const c = collections(db);
-  const run = await c.runs.findOne({ _id: runId } as { _id: string });
+  const run = (await c.runs.findOne({ _id: runId } as { _id: string })) as unknown as RunDoc | null;
   if (!run) return { ok: false, error: 'Run not found' };
   if (run.mode !== 'simulated') {
     return { ok: false, error: 'Live mode: complete payment on the Stripe hosted checkout URL.' };
@@ -562,6 +563,95 @@ export async function startDbFailureRun(): Promise<{ runId: string; eventId: str
   });
 
   return { runId: run._id, eventId: evt.id };
+}
+
+// ─── Scenario 5 · cancel_subscription ───────────────────────────────────────
+
+export async function startCancelRun(
+  input?: { subscriptionId?: string },
+): Promise<{ runId: string; subscriptionId: string }> {
+  const db = await getDb();
+  const c = collections(db);
+  ensureScheduler();
+
+  let sub = input?.subscriptionId
+    ? ((await c.subscriptions.findOne({ subscriptionId: input.subscriptionId } as { subscriptionId: string })) as unknown as SubscriptionDoc | null)
+    : await latestSubscription();
+  if (!sub) {
+    // Nothing to cancel — bring a subscription to life through real checkout.
+    const { runId } = await startCheckoutRun({});
+    await confirmCheckout(runId);
+    sub = await latestSubscription();
+  }
+  if (!sub) throw new Error('Could not find a subscription to cancel');
+  if (sub.status === 'canceled') throw new Error(`Subscription ${sub.subscriptionId} is already canceled`);
+
+  const run = await createRun(
+    'cancel_subscription',
+    { id: sub.priceId, planName: sub.planName, amount: sub.amount, currency: sub.currency },
+    { email: sub.customerEmail, name: sub.customerEmail.split('@')[0] },
+  );
+  await c.runs.updateOne({ _id: run._id } as { _id: string }, {
+    $set: { customerId: sub.customerId, subscriptionId: sub.subscriptionId },
+  });
+
+  await completeStep(run._id, 'cancel_requested', {
+    subscriptionId: sub.subscriptionId,
+    previousStatus: sub.status,
+    atPeriodEnd: false,
+  });
+
+  const meta: SubMeta = {
+    runId: run._id,
+    subscriptionId: sub.subscriptionId,
+    customerId: sub.customerId,
+    customerEmail: sub.customerEmail,
+    planId: sub.priceId,
+    planName: sub.planName,
+    amount: sub.amount,
+    currency: sub.currency,
+  };
+
+  // Stripe emits customer.subscription.deleted when a cancellation takes effect.
+  const evt = await subscriptionDeleted(meta, sub.currentPeriodStart, sub.currentPeriodEnd);
+  const res = await dispatchWebhook(evt, run._id);
+  const body = res.body as { received?: boolean; duplicate?: boolean };
+
+  await completeStep(run._id, 'webhook_delivery', {
+    eventId: evt.id,
+    type: 'customer.subscription.deleted',
+    statusCode: res.httpStatus,
+  });
+  await completeStep(run._id, 'signature_verified', {
+    verified: true,
+    algorithm: 'HMAC-SHA256',
+    eventId: evt.id,
+  });
+  await completeStep(run._id, 'dedup_check', {
+    result: body.duplicate ? 'duplicate blocked' : 'new event',
+    eventId: evt.id,
+    guard: 'unique index webhook_events.eventId',
+  });
+
+  const fresh = await c.subscriptions.findOne({ subscriptionId: sub.subscriptionId } as { subscriptionId: string });
+  if (res.httpStatus !== 200 || body.duplicate || fresh?.status !== 'canceled') {
+    // Record honestly if the cancellation did not commit.
+    await failStep(run._id, 'db_transaction', {
+      error: `expected status canceled, got ${fresh?.status ?? 'unknown'} (endpoint ${res.httpStatus})`,
+      endpointResponse: res.body,
+    });
+    await finishRun(run._id, 'failed');
+    throw new Error(`Cancellation did not commit (subscription status: ${fresh?.status ?? 'unknown'})`);
+  }
+
+  await completeStep(run._id, 'db_transaction', {
+    transaction: 'MongoDB multi-document ACID (replica set rs0)',
+    writes: [`update subscriptions: ${sub.subscriptionId} · status=canceled`],
+    committed: true,
+  });
+
+  await finishRun(run._id, 'completed');
+  return { runId: run._id, subscriptionId: sub.subscriptionId };
 }
 
 // ─── Duplicate run of markStep for live mode helper (unused for now) ────────

@@ -70,6 +70,7 @@ export function ScenarioPanel({
   const [confirmReset, setConfirmReset] = useState(false);
 
   const dbFailure = appState?.flags.dbFailure ?? false;
+  const retryFailure = appState?.flags.retryFailure ?? false;
 
   const post = async (url: string, body?: unknown) => {
     const res = await fetch(url, {
@@ -122,20 +123,25 @@ export function ScenarioPanel({
     }
   };
 
-  const toggleFailure = async (enabled: boolean) => {
+  const toggleFailure = async (flag: 'db_failure' | 'retry_failure', enabled: boolean) => {
     try {
       const res = await fetch('/api/demo/flags', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled }),
+        body: JSON.stringify({ flag, enabled }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      toast({
-        title: enabled ? 'Failure injection ENABLED' : 'Failure injection disabled',
-        description: enabled
+      const title = flag === 'db_failure'
+        ? (enabled ? 'Failure injection ENABLED' : 'Failure injection disabled')
+        : (enabled ? 'Retry decline injection ENABLED' : 'Retry decline injection disabled');
+      const description = flag === 'db_failure'
+        ? (enabled
           ? 'Next mutating webhook write will fail and enter retry backoff.'
-          : 'Redeliveries will now be processed normally.',
-      });
+          : 'Redeliveries will now be processed normally.')
+        : (enabled
+          ? 'Smart retries will be declined until the attempt limit marks the subscription unpaid.'
+          : 'Smart retries will charge normally again.');
+      toast({ title, description });
     } catch (e) {
       toast({ title: 'Flag change failed', description: String(e), variant: 'destructive' });
     }
@@ -209,7 +215,7 @@ export function ScenarioPanel({
         </CardContent>
       </Card>
 
-      <Card className={cn('border-border/60 bg-card/50', dbFailure && 'border-rose-500/50 bg-rose-500/[0.04]')}>
+      <Card className={cn('border-border/60 bg-card/50', (dbFailure || retryFailure) && 'border-rose-500/50 bg-rose-500/[0.04]')}>
         <CardHeader className="px-4 py-3 pb-2">
           <CardTitle className="text-xs font-medium text-muted-foreground">Failure injection</CardTitle>
         </CardHeader>
@@ -225,9 +231,27 @@ export function ScenarioPanel({
             </div>
             <Switch
               checked={dbFailure}
-              onCheckedChange={toggleFailure}
+              onCheckedChange={(v) => void toggleFailure('db_failure', v)}
               aria-label="Toggle database failure injection"
               data-testid="db-failure-switch"
+            />
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="text-xs font-medium" data-testid="retry-failure-label">
+                Retry declines
+              </div>
+              <div className="text-[10px] text-muted-foreground">
+                {retryFailure
+                  ? 'Smart retries decline until the attempt limit → subscription unpaid'
+                  : 'Smart retries charge normally'}
+              </div>
+            </div>
+            <Switch
+              checked={retryFailure}
+              onCheckedChange={(v) => void toggleFailure('retry_failure', v)}
+              aria-label="Toggle retry decline injection"
+              data-testid="retry-failure-switch"
             />
           </div>
           <Button size="sm" variant="outline" className="w-full text-[11px]" onClick={retryNow} data-testid="btn-retry-now">

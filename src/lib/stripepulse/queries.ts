@@ -35,10 +35,11 @@ export async function getAppState(): Promise<AppStatePayload> {
   const c = collections(db);
   const gateway = getGateway();
 
-  const [mongo, dbFailure, plans, subscriptions, attempts, recentEvents, runs, processed, failed, dupes] =
+  const [mongo, dbFailure, retryFailure, plans, subscriptions, attempts, recentEvents, runs, processed, failed, dupes] =
     await Promise.all([
       mongoHealth(),
       getFlag('db_failure'),
+      getFlag('retry_failure'),
       c.plans.find().toArray(),
       c.subscriptions.find().sort({ createdAt: -1 }).limit(12).toArray(),
       c.attempts.find().sort({ createdAt: -1 }).limit(15).toArray(),
@@ -55,7 +56,7 @@ export async function getAppState(): Promise<AppStatePayload> {
   return {
     gateway: { mode: gateway.mode, reason: gateway.reason },
     mongo,
-    flags: { dbFailure },
+    flags: { dbFailure, retryFailure },
     plans: plans as unknown as AppStatePayload['plans'],
     subscriptions: subscriptions as unknown as AppStatePayload['subscriptions'],
     attempts: attempts as unknown as AppStatePayload['attempts'],

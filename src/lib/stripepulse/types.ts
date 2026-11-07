@@ -4,7 +4,8 @@ export type Scenario =
   | 'checkout_success'
   | 'payment_retry'
   | 'duplicate_webhook'
-  | 'db_failure_recovery';
+  | 'db_failure_recovery'
+  | 'cancel_subscription';
 
 export type GatewayMode = 'simulated' | 'live';
 
@@ -165,7 +166,11 @@ export interface RetryJobDoc {
   planId?: string;
   nextRetryAt: string;
   attempts: number;
-  status: 'scheduled' | 'done' | 'canceled';
+  status: 'scheduled' | 'running' | 'done' | 'failed' | 'exhausted' | 'canceled';
+  claimedAt?: string;
+  finishedAt?: string;
+  lastError?: string;
+  note?: string;
   createdAt: string;
 }
 
@@ -190,7 +195,7 @@ export interface RunStatePayload {
 export interface AppStatePayload {
   gateway: { mode: GatewayMode; reason: string };
   mongo: { ok: boolean; version?: string; error?: string };
-  flags: { dbFailure: boolean };
+  flags: { dbFailure: boolean; retryFailure: boolean };
   plans: PlanDoc[];
   subscriptions: SubscriptionDoc[];
   attempts: PaymentAttemptDoc[];
