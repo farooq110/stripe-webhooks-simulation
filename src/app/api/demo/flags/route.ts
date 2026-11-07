@@ -1,6 +1,7 @@
 import type { Document } from 'mongodb';
 
 import { collections, getDb, getFlag, setFlag } from '@/lib/stripepulse/mongo';
+import { guardDemoRequest } from '@/lib/stripepulse/guard';
 import { completeStep } from '@/lib/stripepulse/recorder';
 
 export const dynamic = 'force-dynamic';
@@ -16,6 +17,12 @@ export async function GET() {
 }
 
 export async function PUT(req: Request) {
+  // Same guard as every other demo route (QA finding MEDIUM-1): with
+  // DEMO_API_TOKEN set this route needs the token, and it is rate limited
+  // so a caller cannot hammer the failure switches.
+  const denied = guardDemoRequest(req, { name: 'flags', limit: 30, windowMs: 60_000 });
+  if (denied) return denied;
+
   const body = (await req.json()) as { flag?: FlagName; enabled: boolean };
   // Backwards compatible: a bare { enabled } still means the db_failure flag.
   const flag: FlagName = body.flag === 'retry_failure' ? 'retry_failure' : 'db_failure';

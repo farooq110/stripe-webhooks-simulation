@@ -46,7 +46,16 @@ export function guardDemoRequest(req: Request, opts: GuardOptions): Response | n
     lastCleanup = now;
   }
 
-  const ip = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'local';
+  // Which IP do we count against the limit? The leftmost x-forwarded-for
+  // entry is whatever the caller CLAIMS, so a client could rotate it and get
+  // a fresh bucket every request (QA finding LOW-3). The rightmost entry is
+  // the one our own proxy appended, which the client cannot forge. Behind
+  // the platform proxy that is the proxy's own IP, so the bucket becomes
+  // shared — stricter, and impossible to rotate. With no proxy header at
+  // all (direct access, tests) everything falls into one "local" bucket.
+  const xff = req.headers.get('x-forwarded-for');
+  const parts = xff ? xff.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  const ip = parts.length > 0 ? parts[parts.length - 1] : 'local';
   const key = `${ip}:${opts.name}`;
   const recent = (buckets.get(key) ?? []).filter((t) => now - t < windowMs);
 

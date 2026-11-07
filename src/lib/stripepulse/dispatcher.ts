@@ -68,7 +68,6 @@ export async function dispatchWebhook(
     request: {
       eventId: event.id,
       type: event.type,
-      signature: `Stripe-Signature: ${signature.slice(0, 42)}…`,
       payloadBytes: payload.length,
     },
     response: body,

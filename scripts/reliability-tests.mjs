@@ -318,6 +318,20 @@ console.log('\n■ BUG-6 · reset endpoint is rate limited');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+console.log('\n■ MEDIUM-1 · flags PUT is guarded and rate limited');
+{
+  // The flags PUT used to skip the demo guard entirely. It now has its own
+  // bucket (30 PUTs/minute), so a burst of 35 must hit 429s at the tail.
+  // All calls disable the flag, so this cannot leak state into other tests.
+  const results = [];
+  for (let i = 0; i < 35; i++) {
+    results.push(await api('PUT', '/api/demo/flags', { flag: 'db_failure', enabled: false }));
+  }
+  const tooMany = results.filter((r) => r.status === 429).length;
+  ok('flags rate limit kicked in (≥1× 429 in a 35-call burst)', tooMany >= 1, results.map((r) => r.status).join(','));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 console.log(`\n━━━ RESULT: ${passed} passed, ${failed} failed ━━━`);
 if (failures.length) {
   console.log('Failed checks:');

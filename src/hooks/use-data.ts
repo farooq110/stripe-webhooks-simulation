@@ -38,6 +38,10 @@ export function useRun(runId: string | null): { run: RunStatePayload | null; loa
 
   useEffect(() => {
     aliveRef.current = true;
+    // Reset cached state when the run id changes — intentional setState in
+    // an effect (strict react-hooks rule flags it; this is cleanup, not a
+    // derived-state shortcut).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (!runId) { setRun(null); setLoading(false); return; }
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;

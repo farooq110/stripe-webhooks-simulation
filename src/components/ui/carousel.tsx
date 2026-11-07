@@ -95,6 +95,10 @@ function Carousel({
 
   React.useEffect(() => {
     if (!api) return
+    // Sync the carousel's initial selected snap on mount — intentional
+    // setState in an effect (the strict react-hooks rule flags it, but
+    // this is a one-time sync with the carousel instance).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     onSelect(api)
     api.on("reInit", onSelect)
     api.on("select", onSelect)

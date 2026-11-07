@@ -10,7 +10,7 @@
 !/USER_MANUAL.md
 !/setup.sh
 !/package.json
-!/bun.lock
+!/package-lock.json
 !/tsconfig.json
 !/next.config.ts
 !/postcss.config.mjs
