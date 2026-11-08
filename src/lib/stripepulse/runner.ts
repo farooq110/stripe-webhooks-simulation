@@ -641,7 +641,7 @@ export async function startCancelRun(
       endpointResponse: res.body,
     });
     await finishRun(run._id, 'failed');
-    throw new Error(`Cancellation did not commit (subscription status: ${fresh?.status ?? 'unknown'})`);
+    throw new Error(`Cancellation did not commit (run ${run._id}, subscription status: ${fresh?.status ?? 'unknown'})`);
   }
 
   await completeStep(run._id, 'db_transaction', {

@@ -276,15 +276,70 @@ async function processPaymentRetry(job: RetryJobLike): Promise<void> {
   const evtSubActive = await subscriptionUpdated(meta, 'active', periodEndIso);
 
   const r1 = await dispatchWebhook(evtInvoicePaid, job.runId);
-  await dispatchWebhook(evtPiSucceeded, job.runId);
-  await dispatchWebhook(evtSubActive, job.runId);
+  const r2 = await dispatchWebhook(evtPiSucceeded, job.runId);
+  const r3 = await dispatchWebhook(evtSubActive, job.runId);
 
+  // The charge itself went through (logged above), so this step stays honest
+  // regardless of what the webhook delivery did next.
   await completeStep(job.runId, 'payment_attempt_2', {
     attempt: invoiceAttempt,
     status: 'succeeded',
     paymentIntentId: piId,
     strategy: `smart retry (simulated) · retry ${job.attempts}`,
   });
+
+  // MEDIUM-1: success is what the WEBHOOK committed, not what we dispatched.
+  // A non-200 (e.g. injected DB failure) means nothing was written — the old
+  // code completed every step and marked the job done anyway, reporting a
+  // recovery that never happened.
+  const delivered = r1.httpStatus === 200 && r1.body.duplicate === false;
+  const fresh = await c.subscriptions.findOne({ subscriptionId } as { subscriptionId: string });
+  const recovered = fresh?.status === 'active';
+
+  if (!delivered || !recovered) {
+    await failStep(job.runId, 'webhook_invoice_paid', {
+      eventId: r1.eventId,
+      statusCode: r1.httpStatus,
+      duplicate: r1.body.duplicate === true,
+      error: 'recovery webhook was not processed — nothing committed',
+    });
+    await failStep(job.runId, 'db_transaction_2', {
+      transaction: 'MongoDB multi-document ACID (replica set rs0)',
+      committed: false,
+      error: `subscription status is ${fresh?.status ?? 'unknown'}, not active`,
+    });
+    await failStep(job.runId, 'subscription_recovered', {
+      subscriptionId: sub.subscriptionId,
+      currentStatus: fresh?.status ?? 'unknown',
+      result: 'recovery not applied',
+    });
+
+    if (job.attempts >= MAX_PAYMENT_RETRIES) {
+      // Give up honestly. The charge log said succeeded but the app could not
+      // record it — do NOT fabricate an 'unpaid' transition here. The failed
+      // invoice.paid event stays in the redelivery queue and can still
+      // recover the subscription once deliveries work again.
+      await c.retryJobs.updateOne({ _id: job._id } as { _id: string }, {
+        $set: {
+          status: 'exhausted',
+          finishedAt: nowIso(),
+          lastError: 'recovery webhook undelivered',
+          note: `recovery not committed after ${job.attempts} attempts — redelivery queue still owns the event`,
+        },
+      } as Document);
+      await finishRun(job.runId, 'failed');
+      return;
+    }
+
+    // Still attempts left — reschedule instead of marking done (HIGH-1).
+    const nextRetryAt = new Date(Date.now() + PAYMENT_RETRY_BACKOFF_MS * 2 ** (job.attempts - 1)).toISOString();
+    await c.retryJobs.updateOne({ _id: job._id } as { _id: string }, {
+      $set: { status: 'scheduled', nextRetryAt, lastError: `recovery webhook answered ${r1.httpStatus}` },
+    } as Document);
+    await finishRun(job.runId, 'failed');
+    return;
+  }
+
   await completeStep(job.runId, 'webhook_invoice_paid', {
     eventId: r1.eventId,
     type: 'invoice.paid',
@@ -294,19 +349,24 @@ async function processPaymentRetry(job: RetryJobLike): Promise<void> {
     transaction: 'MongoDB multi-document ACID (replica set rs0)',
     writes: [
       `insert payment_attempts: ${newInvoiceId} · attempt #${invoiceAttempt} · succeeded`,
-      `update subscriptions: ${sub.subscriptionId} · status=active`,
+      `update subscriptions: ${sub.subscriptionId} · status=${fresh?.status ?? 'active'}`,
     ],
     committed: true,
   });
 
-  const fresh = await c.subscriptions.findOne({ subscriptionId } as { subscriptionId: string });
+  // Auxiliary events do not gate the recovery, but a failed delivery among
+  // them must stay visible instead of being overwritten by success.
+  const auxFailed = [r2, r3].filter((r) => r.httpStatus !== 200);
   await completeStep(job.runId, 'subscription_recovered', {
     subscriptionId: sub.subscriptionId,
     from: 'past_due',
     to: fresh?.status ?? 'active',
+    ...(auxFailed.length > 0
+      ? { note: `${auxFailed.length} auxiliary webhook(s) failed — left with the redelivery queue` }
+      : {}),
   });
 
-  // Only NOW is the job allowed to finish — after the work really succeeded.
+  // Only NOW is the job allowed to finish — after the recovery really committed.
   await c.retryJobs.updateOne({ _id: job._id } as { _id: string }, {
     $set: { status: 'done', finishedAt: nowIso() },
   } as Document);

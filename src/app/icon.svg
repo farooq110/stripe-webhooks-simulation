@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- StripePulse mark: indigo tile with a lightning bolt -->
+  <rect width="32" height="32" rx="6.4" fill="#635bff"/>
+  <polygon points="18.6,2 7,17.6 14.7,17.6 12.2,30 25,13.4 16.6,13.4" fill="#ffffff"/>
+</svg>

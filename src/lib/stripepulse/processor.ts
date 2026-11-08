@@ -64,6 +64,23 @@ function subPeriods(obj: Record<string, unknown>): { start: string; end: string 
 // seconds even with scheduler ticks), while QA's stale repro is 3600s old.
 const STALE_EVENT_SKEW_MS = 20_000;
 
+// Ops that represent a real database write (used for the writesExecuted
+// counter — skips and log-only notes must not be counted, QA INFO-1).
+const writeCount = (ops: OpRecord[]) =>
+  ops.filter((o) => o.operation !== 'none' && o.operation !== 'skip').length;
+
+// Full history of webhook deliveries recorded on the run's webhook_delivery
+// step, so multiple deliveries of a run no longer merge invisibly
+// (QA finding INFO-2). Capped at the last 10 entries.
+async function deliveryHistory(runId: string): Promise<unknown[]> {
+  const step = await collections(await getDb()).steps.findOne(
+    { runId, key: 'webhook_delivery' } as Document,
+    { projection: { 'detail.deliveries': 1 } },
+  );
+  const list = (step?.detail as { deliveries?: unknown[] } | undefined)?.deliveries;
+  return Array.isArray(list) ? list.slice(-9) : [];
+}
+
 function eventCreatedMs(event: StripeEvent): number {
   const created = (event as { created?: number }).created;
   return typeof created === 'number' ? created * 1000 : Date.now();
@@ -82,6 +99,36 @@ async function isStaleForSubscription(
   );
   if (!sub?.updatedAt) return false;
   return Date.parse(sub.updatedAt) - eventCreatedMs(event) > STALE_EVENT_SKEW_MS;
+}
+
+// A delayed invoice.paid is NOT the same as an out-of-order one. If the
+// payment it reports is the LATEST attempt for the subscription and the
+// subscription still sits in a failing state, the money is real and the
+// subscription must recover — even when the delivery arrived late (QA finding
+// HIGH-1: dropping it recorded a successful charge while the subscription
+// stayed past_due forever).
+async function isLatestAttemptRecovery(
+  db: Db,
+  session: ClientSession,
+  subscriptionId: string | undefined,
+  invoiceId: string,
+  attempt: number,
+): Promise<boolean> {
+  if (!subscriptionId) return false;
+  const c = collections(db);
+  const sub = await c.subscriptions.findOne(
+    { subscriptionId } as { subscriptionId: string },
+    { session, projection: { status: 1 } },
+  );
+  // Only a subscription that still needs money may be recovered this way.
+  if (!sub || (sub.status !== 'past_due' && sub.status !== 'unpaid')) return false;
+  const latest = await c.attempts.findOne(
+    { subscriptionId } as { subscriptionId: string },
+    { session, sort: { attempt: -1, createdAt: -1 }, projection: { attempt: 1, invoiceId: 1 } },
+  );
+  // No local attempt history — trust the payment event itself.
+  if (!latest) return true;
+  return attempt >= latest.attempt && invoiceId === latest.invoiceId;
 }
 
 async function handleEvent(
@@ -195,6 +242,34 @@ async function handleEvent(
       const invoiceId = obj.id as string;
       const subscriptionId = (obj.subscription as string) ?? md.subscription_id;
       const attempt = Number(md.attempt ?? obj.attempt_count ?? 1);
+
+      // Stale guard FIRST and before any write (QA finding INFO-1): a skipped
+      // event must execute zero writes, so the payment-attempt row is only
+      // inserted once we know the event will actually be applied.
+      //
+      // Exception (QA finding HIGH-1): a delayed invoice.paid whose payment
+      // is the latest attempt for a subscription that is still past_due or
+      // unpaid is a legitimate late recovery, not out-of-order replay —
+      // applying it is the only way the recorded state catches up with the
+      // money Stripe actually took.
+      if (await isStaleForSubscription(db, session, subscriptionId, event)) {
+        const delayedRecovery = paid
+          && (await isLatestAttemptRecovery(db, session, subscriptionId, invoiceId, attempt));
+        if (!delayedRecovery) {
+          ops.push({
+            operation: 'skip',
+            collection: 'subscriptions',
+            detail: `${subscriptionId} · stale ${event.type} ignored · status left untouched`,
+          });
+          break;
+        }
+        ops.push({
+          operation: 'none',
+          collection: '—',
+          detail: `${subscriptionId} · stale invoice.paid accepted as late recovery (latest attempt #${attempt})`,
+        });
+      }
+
       const now = new Date().toISOString();
       await c.attempts.insertOne(
         {
@@ -229,17 +304,6 @@ async function handleEvent(
       const periodEnd = typeof obj.period_end === 'number'
         ? new Date(obj.period_end * 1000).toISOString()
         : new Date(Date.now() + 30 * 86_400_000).toISOString();
-
-      // Stale guard first: an old payment event must not flip a subscription
-      // that has already moved on (e.g. recovered to active) back to past_due.
-      if (await isStaleForSubscription(db, session, subscriptionId, event)) {
-        ops.push({
-          operation: 'skip',
-          collection: 'subscriptions',
-          detail: `${subscriptionId} · stale ${event.type} ignored · status left untouched`,
-        });
-        break;
-      }
 
       const nextStatus = paid ? 'active' : 'past_due';
       await c.subscriptions.updateOne(
@@ -580,6 +644,7 @@ export async function processWebhook(
         statusCode: 500,
         attempt: attempts,
         error: 'DB write failed — Stripe will redeliver',
+        deliveries: [...(await deliveryHistory(runId)), { eventId: event.id, statusCode: 500, attempt: attempts, at: now }],
       });
       await failStep(runId, 'db_transaction', {
         error: 'INJECTED FAILURE · transaction aborted · nothing persisted',
@@ -649,7 +714,12 @@ export async function processWebhook(
     });
     if (runId) {
       await failStep(runId, 'db_transaction', { error: handlerError.message, attempt: attempts });
-      await failStep(runId, 'webhook_delivery', { eventId: event.id, statusCode: 500 });
+      await failStep(runId, 'webhook_delivery', {
+        eventId: event.id,
+        statusCode: 500,
+        attempt: attempts,
+        deliveries: [...(await deliveryHistory(runId)), { eventId: event.id, statusCode: 500, attempt: attempts, at: now }],
+      });
     }
     return { httpStatus: 500, body: { error: handlerError.message, eventId: event.id, nextRetryAt } };
   }
@@ -681,7 +751,7 @@ export async function processWebhook(
     statusCode: 200,
     durationMs,
     request: { eventId: event.id, type: event.type, redelivery: isRetry || undefined, attempt: attempts },
-    response: { received: true, duplicate: false, writesExecuted: ops.filter((o) => o.operation !== 'none').length },
+    response: { received: true, duplicate: false, writesExecuted: writeCount(ops) },
   });
 
   if (runId) {
@@ -691,6 +761,7 @@ export async function processWebhook(
       statusCode: 200,
       attempt: attempts,
       ...(isRetry ? { note: 'accepted on redelivery' } : {}),
+      deliveries: [...(await deliveryHistory(runId)), { eventId: event.id, statusCode: 200, attempt: attempts, at: now }],
     });
     await completeStep(runId, 'signature_verified', {
       algorithm: 'HMAC-SHA256',
@@ -706,7 +777,7 @@ export async function processWebhook(
     if (mutating) {
       await completeStep(runId, 'db_transaction', {
         transaction: 'MongoDB multi-document ACID (replica set rs0)',
-        writes: ops.filter((o) => o.operation !== 'none').map((o) => `${o.operation} ${o.collection}: ${o.detail}`),
+        writes: ops.filter((o) => o.operation !== 'none' && o.operation !== 'skip').map((o) => `${o.operation} ${o.collection}: ${o.detail}`),
         committed: true,
         eventId: event.id,
       });
@@ -719,7 +790,7 @@ export async function processWebhook(
       received: true,
       duplicate: false,
       eventId: event.id,
-      writesExecuted: ops.filter((o) => o.operation !== 'none').length,
+      writesExecuted: writeCount(ops),
     },
   };
 }

@@ -68,6 +68,12 @@ export function ScenarioPanel({
   const [busy, setBusy] = useState<ScenarioId | null>(null);
   const [planId, setPlanId] = useState('price_pro_monthly');
   const [confirmReset, setConfirmReset] = useState(false);
+  // LOW-1: the failure switches are uncontrolled and remount whenever the
+  // polled server value (or a forced revert) changes. A click flips them
+  // instantly, and if the PUT fails the nonce forces them back to the real
+  // server value instead of leaving the operator with an inverted switch.
+  const [flagBusy, setFlagBusy] = useState<'db_failure' | 'retry_failure' | null>(null);
+  const [flagNonce, setFlagNonce] = useState(0);
 
   const dbFailure = appState?.flags.dbFailure ?? false;
   const retryFailure = appState?.flags.retryFailure ?? false;
@@ -124,6 +130,7 @@ export function ScenarioPanel({
   };
 
   const toggleFailure = async (flag: 'db_failure' | 'retry_failure', enabled: boolean) => {
+    setFlagBusy(flag);
     try {
       const res = await fetch('/api/demo/flags', {
         method: 'PUT',
@@ -143,7 +150,11 @@ export function ScenarioPanel({
           : 'Smart retries will charge normally again.');
       toast({ title, description });
     } catch (e) {
+      // The server did not accept the change — snap the switch back.
+      setFlagNonce((n) => n + 1);
       toast({ title: 'Flag change failed', description: String(e), variant: 'destructive' });
+    } finally {
+      setFlagBusy(null);
     }
   };
 
@@ -159,8 +170,11 @@ export function ScenarioPanel({
   const reset = async () => {
     if (!confirmReset) { setConfirmReset(true); setTimeout(() => setConfirmReset(false), 3500); return; }
     try {
-      await post('/api/demo/reset');
+      // INFO-4: drop the selected run BEFORE the reset clears the database,
+      // so the run poller never fires one doomed GET for a run that is just
+      // about to vanish.
       setRunId(null);
+      await post('/api/demo/reset');
       setConfirmReset(false);
       toast({ title: 'Demo environment reset', description: 'All runs, events, subscriptions and logs cleared.' });
     } catch (e) {
@@ -230,7 +244,9 @@ export function ScenarioPanel({
               </div>
             </div>
             <Switch
-              checked={dbFailure}
+              key={`db-${dbFailure}-${flagNonce}`}
+              defaultChecked={dbFailure}
+              disabled={flagBusy === 'db_failure'}
               onCheckedChange={(v) => void toggleFailure('db_failure', v)}
               aria-label="Toggle database failure injection"
               data-testid="db-failure-switch"
@@ -248,7 +264,9 @@ export function ScenarioPanel({
               </div>
             </div>
             <Switch
-              checked={retryFailure}
+              key={`retry-${retryFailure}-${flagNonce}`}
+              defaultChecked={retryFailure}
+              disabled={flagBusy === 'retry_failure'}
               onCheckedChange={(v) => void toggleFailure('retry_failure', v)}
               aria-label="Toggle retry decline injection"
               data-testid="retry-failure-switch"

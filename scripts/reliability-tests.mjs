@@ -105,13 +105,15 @@ function subscriptionEvent(type, sub, extra = {}) {
   };
 }
 
-function invoiceEvent(type, sub, { invoiceId, attempt, stale }) {
+function invoiceEvent(type, sub, { invoiceId, attempt, stale, ageSec }) {
   const declined = type === 'invoice.payment_failed';
+  const nowSec = Math.floor(Date.now() / 1000);
   return {
     id: `evt_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
     object: 'event',
     api_version: '2025-11-17.preview',
-    created: stale ? Math.floor(Date.now() / 1000) - 3600 : Math.floor(Date.now() / 1000),
+    // stale → the QA repro's 1h-old event; ageSec → a custom delay in seconds
+    created: stale ? nowSec - 3600 : ageSec ? nowSec - ageSec : nowSec,
     livemode: false,
     type,
     data: {
@@ -212,6 +214,53 @@ console.log('\n■ BUG-2 · stale event must not regress subscription status');
 
   const fresh = await db.collection('subscriptions').findOne({ subscriptionId: sub.subscriptionId });
   ok('subscription still active after stale event', fresh?.status === 'active', fresh?.status);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n■ HIGH-1 · delayed invoice.paid with the latest attempt recovers past_due');
+{
+  // QA repro: a legitimate recovery arrives late (delivery retries), the sub
+  // moved on in between, and the stale guard used to drop it forever — money
+  // recorded taken, subscription stuck past_due. The fix: a delayed
+  // invoice.paid whose attempt is the LATEST for a past_due/unpaid
+  // subscription is applied, not skipped.
+  const { sub } = await freshCheckout(mc);
+  ok('fresh subscription is active', sub?.status === 'active', sub?.status);
+
+  // Move it to past_due with a current (non-stale) failed payment, attempt #1.
+  const failRes = await postWebhook(invoiceEvent('invoice.payment_failed', sub, {
+    invoiceId: 'in_h1probe', attempt: 1,
+  }));
+  ok('payment failure processed', failRes.status === 200);
+  await waitFor(async () =>
+    (await db.collection('subscriptions').findOne({ subscriptionId: sub.subscriptionId }))?.status === 'past_due',
+    10_000, 'subscription → past_due');
+
+  // The delayed recovery: same invoice, attempt #2 (the latest), created 30s
+  // ago — beyond the 20s skew, so the old guard discarded it.
+  const paid = invoiceEvent('invoice.paid', sub, {
+    invoiceId: 'in_h1probe', attempt: 2, ageSec: 30,
+  });
+  const paidRes = await postWebhook(paid);
+  const paidBody = await paidRes.json().catch(() => ({}));
+  ok('delayed recovery acknowledged 200', paidRes.status === 200, JSON.stringify(paidBody));
+  ok('delayed recovery executed real writes', paidBody.writesExecuted >= 2, String(paidBody.writesExecuted));
+
+  const recovered = await db.collection('subscriptions').findOne({ subscriptionId: sub.subscriptionId });
+  ok('subscription recovered to active (was stuck past_due)', recovered?.status === 'active', recovered?.status);
+  const attemptRow = await db.collection('payment_attempts').findOne({ _id: 'in_h1probe_a2' });
+  ok('successful attempt row recorded', attemptRow?.status === 'succeeded', attemptRow?.status);
+
+  // The old protection must survive: a stale invoice.paid for a SUPERSEDED
+  // attempt (or an active subscription) is still skipped with zero writes.
+  const oldPaid = invoiceEvent('invoice.paid', sub, {
+    invoiceId: 'in_h1old', attempt: 1, ageSec: 3600,
+  });
+  const oldRes = await postWebhook(oldPaid);
+  const oldBody = await oldRes.json().catch(() => ({}));
+  ok('superseded stale invoice.paid still skipped', oldRes.status === 200 && oldBody.writesExecuted === 0, JSON.stringify(oldBody));
+  const stillActive = await db.collection('subscriptions').findOne({ subscriptionId: sub.subscriptionId });
+  ok('status untouched by the skipped event', stillActive?.status === 'active', stillActive?.status);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,11 +367,61 @@ console.log('\n■ BUG-6 · reset endpoint is rate limited');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+console.log('\n■ MEDIUM-1 · dunning reports failure while the recovery webhook fails');
+{
+  // QA repro: with the DB-failure injection on, the dunning job's
+  // invoice.paid delivery answered 500 — yet the run was marked completed
+  // and the job done. Now the steps fail, the job reschedules (never a
+  // silent 'done'), and once the injection clears, the redelivery queue
+  // still recovers the subscription.
+  // NOTE: the scenario starter clears a pending db_failure on purpose, so
+  // the injection is armed AFTER the job is scheduled (it fires ~6s later).
+  const { json: started } = await api('POST', '/api/demo/scenarios/payment-retry');
+  const runId = started?.runId;
+  await waitFor(async () =>
+    (await db.collection('retry_jobs').findOne({ runId }))?.status === 'scheduled',
+    15_000, 'retry job scheduled');
+  const arm = await api('PUT', '/api/demo/flags', { flag: 'db_failure', enabled: true });
+  ok('db_failure injection armed after scheduling', arm.status === 200, String(arm.status));
+
+  // Retries burn their attempts against the failing deliveries (6s + 12s
+  // backoff) and end exhausted — but NOT 'done'.
+  await waitFor(async () => {
+    const job = await db.collection('retry_jobs').findOne({ runId });
+    return job && (job.status === 'exhausted' || job.status === 'done');
+  }, 120_000, 'dunning job to give up against failing deliveries');
+
+  const job = await db.collection('retry_jobs').findOne({ runId });
+  ok('job ended exhausted, not silently done', job?.status === 'exhausted', job?.status);
+  ok('exhaustion note names the redelivery queue', String(job?.note ?? '').includes('redelivery'), job?.note);
+
+  const step = await db.collection('run_steps').findOne({ runId, key: 'webhook_invoice_paid' });
+  ok('webhook_invoice_paid step honestly failed', step?.status === 'failed', step?.status);
+  const txn = await db.collection('run_steps').findOne({ runId, key: 'db_transaction_2' });
+  ok('db_transaction_2 step does not claim committed', txn?.detail?.committed === false, JSON.stringify(txn?.detail ?? {}));
+  const run = await db.collection('runs').findOne({ _id: runId });
+  ok('run honestly recorded as failed', run?.status === 'failed', run?.status);
+
+  const sub = await db.collection('subscriptions').findOne({ subscriptionId: job.subscriptionId });
+  ok('subscription not falsely recovered', sub?.status === 'past_due', sub?.status);
+
+  // Clear the injection — the queued invoice.paid events recover the sub.
+  await api('PUT', '/api/demo/flags', { flag: 'db_failure', enabled: false });
+  await waitFor(async () =>
+    (await db.collection('subscriptions').findOne({ subscriptionId: job.subscriptionId }))?.status === 'active',
+    60_000, 'redelivery queue to recover the subscription');
+  const recovered = await db.collection('subscriptions').findOne({ subscriptionId: job.subscriptionId });
+  ok('subscription recovered via redelivery after injection cleared', recovered?.status === 'active', recovered?.status);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 console.log('\n■ MEDIUM-1 · flags PUT is guarded and rate limited');
 {
   // The flags PUT used to skip the demo guard entirely. It now has its own
   // bucket (30 PUTs/minute), so a burst of 35 must hit 429s at the tail.
   // All calls disable the flag, so this cannot leak state into other tests.
+  // NOTE: this burst runs LAST — the rate-limit window it fills must not
+  // starve any later section.
   const results = [];
   for (let i = 0; i < 35; i++) {
     results.push(await api('PUT', '/api/demo/flags', { flag: 'db_failure', enabled: false }));
