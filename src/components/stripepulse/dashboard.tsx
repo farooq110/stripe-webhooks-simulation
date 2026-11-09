@@ -9,7 +9,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { AnimationController } from '@/components/stripepulse/animation-controller';
 import { CheckoutDialog } from '@/components/stripepulse/checkout-dialog';
 import { EventTerminal } from '@/components/stripepulse/event-terminal';
-import { PipelineSkeleton } from '@/components/stripepulse/pipeline-skeleton';
+import { PipelineEmptyState, PipelineSkeleton } from '@/components/stripepulse/pipeline-skeleton';
 import { ScenarioPanel } from '@/components/stripepulse/scenario-panel';
 import { StepInspector } from '@/components/stripepulse/step-inspector';
 import { SubscriptionsPanel, AttemptsTable } from '@/components/stripepulse/subscriptions-panel';
@@ -129,7 +129,13 @@ export default function Dashboard() {
               )}
             </div>
             <div className="relative min-h-[300px] flex-1">
-              {run ? <Pipeline steps={steps} playhead={playhead} /> : <PipelineSkeleton />}
+              {run ? (
+                <Pipeline steps={steps} playhead={playhead} />
+              ) : appState ? (
+                <PipelineEmptyState />
+              ) : (
+                <PipelineSkeleton />
+              )}
             </div>
           </Card>
 
