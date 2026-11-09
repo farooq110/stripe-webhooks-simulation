@@ -228,6 +228,51 @@ async function testReset(client) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+async function testGatewayMode(client) {
+  console.log('\n■ Gateway mode switcher');
+
+  // GET reports the active mode plus live readiness, and never leaks the key.
+  const first = await api('GET', '/api/gateway/mode');
+  ok('mode GET 200', first.status === 200);
+  ok('mode GET reports a valid mode', first.json?.mode === 'simulated' || first.json?.mode === 'live');
+  ok('mode GET reports live readiness', typeof first.json?.live?.configured === 'boolean');
+  ok('mode GET masks the secret key', !/(?:sk|rk)_test_[A-Za-z0-9]{40,}/.test(JSON.stringify(first.json)));
+
+  // Invalid payloads are rejected with 400, not 500.
+  const badValue = await api('POST', '/api/gateway/mode', { mode: 'production' });
+  ok('mode POST rejects an unknown mode', badValue.status === 400);
+  const missing = await api('POST', '/api/gateway/mode', {});
+  ok('mode POST rejects a missing mode', missing.status === 400);
+
+  if (first.json?.live?.configured) {
+    // Key present in this environment — the full round trip is exercisable.
+    const live = await api('POST', '/api/gateway/mode', { mode: 'live' });
+    ok('mode POST live 200', live.status === 200);
+    ok('mode POST live activates the live gateway', live.json?.mode === 'live');
+    ok('mode POST persists the choice', live.json?.source === 'dashboard');
+    const health = await api('GET', '/api/health');
+    ok('health reports live after the switch', health.json?.gateway?.mode === 'live');
+    const state = await api('GET', '/api/state');
+    ok('state reports live after the switch', state.json?.gateway?.mode === 'live');
+  } else {
+    // No key configured — switching to live must be refused, not crash.
+    const refused = await api('POST', '/api/gateway/mode', { mode: 'live' });
+    ok('mode POST live refused without a key', refused.status === 400);
+  }
+
+  // Always restore simulation so the rest of the environment is unaffected.
+  const back = await api('POST', '/api/gateway/mode', { mode: 'simulated' });
+  ok('mode POST simulated restores', back.status === 200 && back.json?.mode === 'simulated');
+  const healthAfter = await api('GET', '/api/health');
+  ok('health reports simulated after restore', healthAfter.json?.gateway?.mode === 'simulated');
+
+  // The choice survives restarts because it lands in MongoDB.
+  const saved = await client.db().collection('app_settings').findOne({ _id: 'gatewayMode' });
+  ok('mode choice persisted in app_settings', saved?.value?.mode === 'simulated');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function main() {
   const client = await mongo();
   const t0 = Date.now();
@@ -239,6 +284,7 @@ async function main() {
     await testPaymentRetry(client);
     await testDbFailure(client);
     await testReset(client);
+    await testGatewayMode(client); // runs last: flips the global gateway mode
   } finally {
     await client.close();
   }

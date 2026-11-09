@@ -10,9 +10,18 @@
 
 import Stripe from 'stripe';
 import type { GatewayMode } from './types';
-import { nextSeq } from './mongo';
+import { getSetting, nextSeq, setSetting } from './mongo';
 import { webhookSecret } from './crypto';
 import { config } from './config';
+
+/** Key under app_settings where the dashboard's last mode choice is kept. */
+const MODE_SETTING_KEY = 'gatewayMode';
+
+/** Shape persisted for the dashboard mode switcher. */
+export interface GatewayModeSetting {
+  mode: GatewayMode;
+  updatedAt: string;
+}
 
 export interface StripeEvent {
   id: string;
@@ -67,7 +76,9 @@ async function simId(prefix: string): Promise<string> {
 
 class SimulatedGateway implements Gateway {
   readonly mode: GatewayMode = 'simulated';
-  readonly reason = 'No STRIPE_SECRET_KEY configured — deterministic in-process gateway. Add a Test Mode key to .env to activate live Stripe.';
+  /** Set by buildGateway so the reason stays honest in both situations. */
+  reason =
+    'No STRIPE_SECRET_KEY configured — deterministic in-process gateway. Add a Test Mode key to .env to activate live Stripe.';
 
   async createCustomer(email: string, name: string): Promise<string> {
     return simId('cus');
@@ -207,19 +218,90 @@ class LiveGateway implements Gateway {
 // Factory
 // ─────────────────────────────────────────────────────────────────────────────
 
-const g = globalThis as unknown as { __sp_gateway?: Gateway };
+const g = globalThis as unknown as {
+  __sp_gateway?: Gateway;
+  /** Once-per-process restore of the persisted dashboard mode choice. */
+  __sp_modeRestore?: Promise<void>;
+};
+
+function buildGateway(mode: GatewayMode): Gateway {
+  if (mode === 'live') {
+    const key = process.env.STRIPE_SECRET_KEY;
+    if (!key) throw new Error('Live mode requires STRIPE_SECRET_KEY in the environment');
+    return new LiveGateway(key, process.env.STRIPE_WEBHOOK_SECRET);
+  }
+  const sim = new SimulatedGateway();
+  if (liveModeConfigured()) {
+    sim.reason =
+      'Simulation selected — a Stripe Test Mode key is loaded; switch to Live in the top bar to call the real API.';
+  }
+  return sim;
+}
 
 export function getGateway(): Gateway {
   if (g.__sp_gateway) return g.__sp_gateway;
+  // Boot default, unchanged: STRIPE_GATEWAY_MODE forces a mode, otherwise a
+  // classic sk_test_ secret key auto-enables live. A dashboard override (see
+  // setGatewayMode / ensureGatewayModeRestored) replaces this afterwards.
   const forced = process.env.STRIPE_GATEWAY_MODE as GatewayMode | undefined;
   const key = process.env.STRIPE_SECRET_KEY;
   if (forced === 'live' || (!forced && key && key.startsWith('sk_test_'))) {
-    if (!key) throw new Error('STRIPE_GATEWAY_MODE=live requires STRIPE_SECRET_KEY');
-    g.__sp_gateway = new LiveGateway(key, process.env.STRIPE_WEBHOOK_SECRET);
+    g.__sp_gateway = buildGateway('live');
   } else {
-    g.__sp_gateway = new SimulatedGateway();
+    g.__sp_gateway = buildGateway('simulated');
   }
   return g.__sp_gateway;
+}
+
+/** True when the environment has what a live switch needs (a Stripe secret key). */
+export function liveModeConfigured(): boolean {
+  return Boolean(process.env.STRIPE_SECRET_KEY);
+}
+
+/**
+ * Swap the active gateway at runtime (dashboard mode switcher). Throws for a
+ * live switch without a secret key — the API route turns that into a 400.
+ */
+export function setGatewayMode(mode: GatewayMode): Gateway {
+  const next = buildGateway(mode);
+  g.__sp_gateway = next;
+  return next;
+}
+
+/**
+ * Re-apply the mode the user last picked on the dashboard, which survives
+ * restarts in MongoDB. Runs at most once per process; until the first
+ * successful read (or on any failure) the env-based default stays active.
+ * A persisted "live" is ignored when the secret key has since been removed.
+ */
+export function ensureGatewayModeRestored(): Promise<void> {
+  if (!g.__sp_modeRestore) {
+    g.__sp_modeRestore = (async () => {
+      try {
+        const saved = await getSetting<GatewayModeSetting>(MODE_SETTING_KEY);
+        if (saved && (saved.mode === 'live' || saved.mode === 'simulated')) {
+          if (saved.mode === 'live' && !liveModeConfigured()) return;
+          setGatewayMode(saved.mode);
+        }
+      } catch {
+        // Mongo not reachable (yet) or settings missing — keep env default.
+      }
+    })();
+  }
+  return g.__sp_modeRestore;
+}
+
+/** Persist the dashboard's mode choice so it survives a restart. */
+export async function persistGatewayMode(mode: GatewayMode): Promise<void> {
+  await setSetting<GatewayModeSetting>(MODE_SETTING_KEY, {
+    mode,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+/** The persisted dashboard choice, if any (null until someone switched). */
+export function readGatewayModeSetting(): Promise<GatewayModeSetting | null> {
+  return getSetting<GatewayModeSetting>(MODE_SETTING_KEY);
 }
 
 export { webhookSecret, API_VERSION, simId };

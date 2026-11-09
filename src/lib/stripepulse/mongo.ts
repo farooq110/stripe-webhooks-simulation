@@ -97,7 +97,7 @@ async function ensureSchema(db: Db): Promise<void> {
   const colls = [
     'runs', 'run_steps', 'webhook_events', 'api_logs', 'db_logs',
     'payment_attempts', 'subscriptions', 'customers', 'retry_jobs',
-    'plans', 'flags', 'counters',
+    'plans', 'flags', 'counters', 'app_settings',
   ];
   const existing = new Set(await db.listCollections().toArray().then((a) => a.map((c) => c.name)));
   for (const c of colls) {
@@ -193,6 +193,23 @@ export async function setFlag(name: string, enabled: boolean): Promise<void> {
     { $set: { enabled, updatedAt: new Date().toISOString() } },
     { upsert: true },
   );
+}
+
+/**
+ * Tiny key/value store for operational settings that must survive a restart
+ * (today: the dashboard's gateway mode choice). String ids, JSON values.
+ */
+export async function getSetting<T>(key: string): Promise<T | null> {
+  const db = await getDb();
+  const doc = await db.collection<{ _id: string; value: T }>('app_settings').findOne({ _id: key });
+  return doc?.value ?? null;
+}
+
+export async function setSetting<T>(key: string, value: T): Promise<void> {
+  const db = await getDb();
+  await db
+    .collection<{ _id: string; value: T }>('app_settings')
+    .updateOne({ _id: key }, { $set: { value } }, { upsert: true });
 }
 
 /** Shape of a webhook_events row — typed so update filters/operators check. */

@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { ModeSwitcher } from '@/components/stripepulse/mode-switcher';
 import type { AppStatePayload } from '@/lib/stripepulse/types';
 import { cn } from '@/lib/utils';
 
@@ -34,6 +35,7 @@ export function TopBar({ appState }: { appState: AppStatePayload | null }) {
       </div>
 
       <div className="ml-auto flex items-center gap-2">
+        {gateway && <ModeSwitcher mode={gateway.mode} />}
         {gateway && (
           <Tooltip>
             <TooltipTrigger asChild>

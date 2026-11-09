@@ -70,9 +70,10 @@ All of these are optional. Copy `.env.example` to `.env` and change what you nee
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `STRIPE_GATEWAY_MODE` | `sim` | Force a gateway. `sim` = built-in simulator, `live` = real Stripe SDK (requires a secret key). |
-| `STRIPE_SECRET_KEY` | — | Stripe test key. If set and it starts with `sk_test_`, live mode turns on automatically. |
-| `STRIPE_WEBHOOK_SECRET` | — | Signing secret for live webhook verification (the `whsec_...` from `stripe listen`). |
+| `STRIPE_GATEWAY_MODE` | `sim` | Boot-time gateway. `sim` = built-in simulator, `live` = real Stripe SDK (requires a secret key). This is only the starting value — the dashboard's mode switcher overrides it at runtime and the last choice is remembered in MongoDB (`app_settings`), surviving restarts. |
+| `STRIPE_SECRET_KEY` | — | Stripe TEST key — a classic `sk_test_` or a restricted `rk_test_` key. Required for the **Live** position of the dashboard mode switcher. If set and it starts with `sk_test_`, live mode also turns on automatically at boot. |
+| `STRIPE_CLIENT_KEY` | — | Stripe publishable key (`pk_test_...`). Public by design; `GET /api/gateway/mode` reports it so the UI can show which account is wired up. |
+| `STRIPE_WEBHOOK_SECRET` | — | Signing secret for live webhook verification — the `whsec_...` Stripe shows for your webhook endpoint (a public URL ending in `/api/webhooks/stripe`), or from `stripe listen`. Live webhooks are verified by the official Stripe SDK against this secret. |
 | `STRIPE_SIM_WEBHOOK_SECRET` | random per start | Signing secret used by the simulator. If you leave it empty the app generates a random one each start — safe, but you can't sign test webhooks from scripts. Set your own random value (e.g. `openssl rand -hex 32`) to run `scripts/api-tests.mjs` and `scripts/reliability-tests.mjs`. |
 | `APP_URL` | `http://127.0.0.1:3000` | Used for checkout success/cancel redirect URLs. |
 | `DEMO_API_TOKEN` | — | Optional. If set, every mutating `/api/demo/*` endpoint requires the header `x-demo-token: <value>`. Use this on public deployments; the dashboard buttons will then only work for scripts that send the header. |
@@ -89,6 +90,29 @@ All of these are optional. Copy `.env.example` to `.env` and change what you nee
 | `STRIPE_API_MAX_RETRIES` | `2` | SDK-level network retries for live Stripe API calls. |
 
 Note: the MongoDB connection is hardcoded to `127.0.0.1:27017` (database name `stripepulse`, replica set `rs0`) — see the top of `src/lib/stripepulse/mongo.ts`. Change it there if you need a different host.
+
+## Switching between Simulation and Live mode
+
+The top bar has a two-button switcher next to the gateway badge:
+
+- **Simulation** — everything runs in-process, no Stripe account needed. Default.
+- **Live** — runs call the real Stripe API (Test Mode) with the configured secret key. Needs `STRIPE_SECRET_KEY` in `.env`; without it the button is disabled.
+
+Clicking **Live** opens a confirmation dialog that spells out what changes: real customers and checkout sessions are created in your Stripe account, and Stripe must deliver webhooks to `<your-public-url>/api/webhooks/stripe` — add that endpoint in the Stripe dashboard (Developers → Webhooks) and paste its `whsec_...` into `STRIPE_WEBHOOK_SECRET`.
+
+Behavior details:
+
+- The choice is persisted in MongoDB (`app_settings`, key `gatewayMode`) and re-applied after a restart, so it survives server restarts. `STRIPE_GATEWAY_MODE` is only the boot default until the first switch.
+- A persisted `live` is safely ignored at boot if the secret key has since been removed — the app falls back to simulation instead of crashing.
+- The active mode can also be switched by API, which is what the buttons call:
+
+```bash
+curl http://127.0.0.1:3000/api/gateway/mode                       # current mode + live readiness
+curl -X POST http://127.0.0.1:3000/api/gateway/mode \
+  -H 'content-type: application/json' -d '{"mode":"live"}'        # switch (400 if no key configured)
+```
+
+Both endpoints pass the same guard as the other demo endpoints (rate limit, plus the `x-demo-token` gate when `DEMO_API_TOKEN` is set); POST is limited to 12 switches per minute.
 
 ## Verify the install
 

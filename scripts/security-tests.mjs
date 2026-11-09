@@ -5,12 +5,14 @@
 // signature-gated (not token-gated), exactly like a real Stripe endpoint.
 //
 // Run: node scripts/security-tests.mjs
-// NOTE: the script starts and stops its own Next dev server on :3000 — stop
-// any running dev server first (the run-all wrapper does that).
+// The dedicated server runs on :3100, so it can never collide with an
+// already-running dev server on :3000 (a collision used to make waitHealthy()
+// probe the wrong, tokenless server and report nonsense failures).
 
 import { spawn } from 'node:child_process';
 
-const BASE = 'http://127.0.0.1:3000';
+const PORT = 3100;
+const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = 'hardening-token-test-12345';
 
 let passed = 0;
@@ -50,7 +52,7 @@ async function waitHealthy() {
 
 async function main() {
   console.log('\n■ Starting dedicated server with DEMO_API_TOKEN set');
-  const child = spawn('npx', ['next', 'dev'], {
+  const child = spawn('npx', ['next', 'dev', '-p', String(PORT)], {
     cwd: new URL('..', import.meta.url).pathname,
     env: {
       ...process.env,

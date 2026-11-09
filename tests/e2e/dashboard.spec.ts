@@ -247,4 +247,24 @@ test.describe.serial('StripePulse dashboard', () => {
     await expect(page.locator('footer')).toBeVisible();
     await ctx.close();
   });
+
+  test('gateway mode switcher: simulation active, live asks for confirmation', async ({ page }: { page: Page }) => {
+    // Make the starting state deterministic (the choice persists in MongoDB).
+    await api('/api/gateway/mode', 'POST', { mode: 'simulated' });
+    await page.goto('/');
+
+    const switcher = page.getByTestId('mode-switcher');
+    await expect(switcher).toBeVisible();
+
+    // Simulation is the active side; live shows its confirm dialog on click.
+    await page.getByTestId('mode-live').click();
+    const dialog = page.getByTestId('mode-live-confirm');
+    await expect(dialog).toBeVisible();
+    await page.getByTestId('mode-live-cancel').click();
+    await expect(dialog).toBeHidden();
+
+    // Nothing changed after cancelling — gateway stays simulated.
+    const state = await api('/api/state');
+    expect(state.gateway.mode).toBe('simulated');
+  });
 });

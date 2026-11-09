@@ -22,6 +22,14 @@ In the top bar you'll see one of two badges:
 
 The badge also shows a short reason string, for example why live mode is off. This is the honest status of the system, not a decoration.
 
+### Switching modes on the dashboard
+
+Right next to the badge sits a two-button switcher: **Simulation** and **Live**. Clicking the other one swaps the gateway immediately — no restart needed — and the choice is remembered (MongoDB), so it survives a server restart.
+
+- **Live** asks for confirmation first, because it changes what a run actually does: from then on runs call the real Stripe API (Test Mode) and create real customers, checkout sessions and subscriptions in your Stripe account. The dialog also reminds you to point a Stripe webhook endpoint at `/api/webhooks/stripe`.
+- If no `STRIPE_SECRET_KEY` is configured, the **Live** button is disabled and the dialog tells you what to add.
+- Switching back to **Simulation** returns to the deterministic in-process gateway. Runs already completed keep the mode they ran in — each run records which gateway produced it (see the run header in the pipeline card).
+
 ## 2. Running a scenario
 
 In the left rail, pick a plan (Starter or Pro) and click one of the four scenario buttons:

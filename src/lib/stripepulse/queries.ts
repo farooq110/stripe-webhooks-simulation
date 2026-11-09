@@ -4,7 +4,7 @@ import type { Document } from 'mongodb';
 
 import type { AppStatePayload, RunStatePayload } from './types';
 import { collections, getDb, getFlag, mongoHealth } from './mongo';
-import { getGateway } from './gateway';
+import { ensureGatewayModeRestored, getGateway } from './gateway';
 
 export async function getRunState(runId: string): Promise<RunStatePayload | null> {
   const db = await getDb();
@@ -31,6 +31,8 @@ export async function getRunState(runId: string): Promise<RunStatePayload | null
 }
 
 export async function getAppState(): Promise<AppStatePayload> {
+  // A dashboard mode choice from a previous process wins over the env default.
+  await ensureGatewayModeRestored();
   const db = await getDb();
   const c = collections(db);
   const gateway = getGateway();

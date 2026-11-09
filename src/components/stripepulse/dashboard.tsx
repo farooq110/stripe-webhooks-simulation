@@ -167,7 +167,7 @@ export default function Dashboard() {
       {/* Sticky footer — always at the bottom, no floating gap */}
       <footer className="mt-auto flex h-8 shrink-0 items-center justify-between border-t border-border/60 px-4 font-mono text-[9.5px] text-muted-foreground">
         <span className="truncate">
-          StripePulse · simulated Stripe semantics · MongoDB {appState?.mongo.version ?? '?'} replica set · genuine HMAC signatures & ACID webhook processing
+          StripePulse · {appState?.gateway.mode === 'live' ? 'live Stripe (test mode)' : 'simulated Stripe semantics'} · MongoDB {appState?.mongo.version ?? '?'} replica set · genuine HMAC signatures & ACID webhook processing
         </span>
         <span className="hidden shrink-0 sm:block" data-testid="replay-note">
           replay is read-only — it never re-executes payments or webhooks
