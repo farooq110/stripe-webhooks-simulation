@@ -19,6 +19,7 @@ import type { Db, ClientSession, WithTransactionCallback, Document } from 'mongo
 import { collections, getDb, getFlag } from './mongo';
 import { getGateway, type StripeEvent } from './gateway';
 import { verifySignature } from './crypto';
+import { config, webhookBackoffMs } from './config';
 import { completeStep, failStep, logApi, logDb } from './recorder';
 
 export const WEBHOOK_PATH = '/api/webhooks/stripe';
@@ -195,9 +196,8 @@ async function handleEvent(
     case 'customer.subscription.updated':
     case 'customer.subscription.deleted': {
       const subscriptionId = obj.id as string;
-      const status = event.type === 'customer.subscription.deleted'
-        ? 'canceled'
-        : (obj.status as string) ?? 'active';
+      const deleted = event.type === 'customer.subscription.deleted';
+      const status = deleted ? 'canceled' : (obj.status as string) ?? 'active';
       const periods = subPeriods(obj);
       const now = new Date().toISOString();
 
@@ -223,15 +223,51 @@ async function handleEvent(
       if (md.price_id) set.priceId = md.price_id;
       if (md.plan_name) set.planName = md.plan_name;
       if (md.customer_email) set.customerEmail = md.customer_email;
+
+      // Cancellation lifecycle fields (Stripe semantics): a period-end
+      // cancellation keeps the subscription active but flags it; a reversal
+      // clears the flag. An immediate cancellation (deleted) clears any
+      // pending flag because the subscription is gone.
+      if (deleted) {
+        set.cancelAtPeriodEnd = false;
+      } else if (typeof obj.cancel_at_period_end === 'boolean') {
+        set.cancelAtPeriodEnd = obj.cancel_at_period_end;
+        if (obj.cancel_at_period_end) {
+          const cancelAt = typeof obj.cancel_at === 'number'
+            ? new Date(obj.cancel_at * 1000).toISOString()
+            : periods.end;
+          set.cancelAt = cancelAt;
+          set.canceledAt = (typeof obj.canceled_at === 'number'
+            ? new Date(obj.canceled_at * 1000).toISOString()
+            : now);
+        } else {
+          // Reversal — the pending cancellation is gone. cancelAt is removed
+          // via $unset below (it must not appear in $set too).
+          set.canceledAt = null;
+        }
+      }
+
+      const unset: Record<string, unknown> = {};
+      if (deleted) {
+        unset.cancelAt = '';
+      } else if (typeof obj.cancel_at_period_end === 'boolean' && !obj.cancel_at_period_end) {
+        unset.cancelAt = '';
+      }
+
       await c.subscriptions.updateOne(
         { subscriptionId } as { subscriptionId: string },
-        { $set: set, $setOnInsert: { createdAt: now, customerId: obj.customer as string } },
+        { $set: set, $setOnInsert: { createdAt: now, customerId: obj.customer as string }, ...(Object.keys(unset).length ? { $unset: unset } : {}) },
         { upsert: true, session },
       );
+      const cancelNote = set.cancelAtPeriodEnd === true
+        ? ' · cancellation scheduled for period end'
+        : set.cancelAtPeriodEnd === false && event.type === 'customer.subscription.updated' && typeof obj.cancel_at_period_end === 'boolean'
+          ? ' · pending cancellation reversed'
+          : '';
       ops.push({
         operation: 'update',
         collection: 'subscriptions',
-        detail: `${subscriptionId} · status=${status}`,
+        detail: `${subscriptionId} · status=${status}${cancelNote}`,
       });
       break;
     }
@@ -353,8 +389,13 @@ async function acknowledgeDuplicate(
     { eventId: event.id } as { eventId: string },
     {
       $push: { deliveries: { at: now, httpStatus: 200, duplicate: true } },
-      $set: { status: 'duplicate' },
     },
+  );
+  // Mark the row duplicate only if it was never fully processed — a mirrored
+  // sibling must not downgrade a 'processed' row (the event DID run once).
+  await c.events.updateOne(
+    { eventId: event.id, status: { $ne: 'processed' } } as Document,
+    { $set: { status: 'duplicate' } },
   );
   await logDb({
     runId,
@@ -485,19 +526,29 @@ export async function processWebhook(
   const gateway = getGateway();
 
   // ── 1 · Signature verification ────────────────────────────────────────────
+  // The two gateway modes can never accept each other's signatures:
+  //   · live → verified by the official Stripe SDK against STRIPE_WEBHOOK_SECRET
+  //     (the whsec_... of the real Stripe endpoint), raw body untouched;
+  //   · simulated → verified by the identical HMAC scheme against the separate
+  //     STRIPE_SIM_WEBHOOK_SECRET, which is generated per process and never
+  //     equals the live secret. A sim-signed payload in live mode (or a live
+  //     signed payload in sim mode) fails HMAC comparison → 400.
   let verified = false;
   let verifyReason = '';
+  let scheme: 'stripe-sdk' | 'sim-hmac' | null = null;
   let event: StripeEvent | null = null;
   try {
     if (gateway.mode === 'live') {
       event = await gateway.constructWebhookEvent(raw, signature ?? '');
       verified = true;
+      scheme = 'stripe-sdk';
     } else {
-      const v = verifySignature(raw, signature);
+      const v = verifySignature(raw, signature, undefined, config.signatureToleranceSeconds);
       verifyReason = v.reason ?? '';
       if (v.ok) {
         event = await gateway.constructWebhookEvent(raw, signature ?? '');
         verified = true;
+        scheme = 'sim-hmac';
       }
     }
   } catch (e) {
@@ -517,7 +568,7 @@ export async function processWebhook(
     });
     return { httpStatus: 400, body: { error: verifyReason || 'Webhook signature verification failed' } };
   }
-
+  const correlationId = event.id;
   const runId = ((event.data.object as Record<string, unknown>).metadata as Record<string, string>)
     ?.run_id ?? undefined;
 
@@ -531,9 +582,8 @@ export async function processWebhook(
   //   · a delivery arriving while another worker still holds a live claim
   //     waits for that worker's outcome and mirrors it. It never processes in
   //     parallel, so the event can no longer be corrupted by the race.
-  const CLAIM_TTL_MS = 30_000;
   const now = new Date().toISOString();
-  const claimExpiresAt = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
+  const claimExpiresAt = new Date(Date.now() + config.claimTtlMs).toISOString();
   let attempts = 1;
   let isRetry = false;
 
@@ -547,6 +597,7 @@ export async function processWebhook(
       status: 'processing',
       attempts: 1,
       signatureVerified: true,
+      signatureScheme: scheme ?? undefined,
       deliveries: [],
       claimExpiresAt,
       createdAt: now,
@@ -606,21 +657,26 @@ export async function processWebhook(
 
   if (mutating && injectionEnabled) {
     // Fail BEFORE any write — mirrors a DB outage. Transaction not even opened.
-    const backoffMs = Math.min(2000 * 2 ** (attempts - 1), 30_000);
+    const backoffMs = webhookBackoffMs(attempts);
     const nextRetryAt = new Date(Date.now() + backoffMs).toISOString();
+    // Dead-letter: once the redelivery budget is spent the event stops being
+    // retried automatically and waits for a manual requeue (Area 3).
+    const dead = attempts >= config.maxWebhookRedeliveries;
     await c.events.updateOne(
       { eventId: event.id } as { eventId: string },
       {
         $set: {
-          status: 'failed',
+          status: dead ? 'dead' : 'failed',
           lastError: 'InjectedDbFailure: demo DB failure flag is enabled',
-          nextRetryAt,
+          nextRetryAt: dead ? undefined : nextRetryAt,
+          ...(dead ? { deadAt: now } : {}),
         },
         $push: { deliveries: { at: now, httpStatus: 500, duplicate: false } },
-      },
+      } as Document,
     );
     await logDb({
       runId,
+      correlationId,
       operation: mutating ? 'transaction' : 'none',
       collection: 'multiple',
       detail: `INJECTED FAILURE before write · ${event.type} · tx aborted, nothing persisted`,
@@ -629,6 +685,7 @@ export async function processWebhook(
     });
     await logApi({
       runId,
+      correlationId,
       direction: 'inbound',
       component: 'app webhook endpoint',
       method: 'POST',
@@ -636,7 +693,12 @@ export async function processWebhook(
       statusCode: 500,
       durationMs: Date.now() - t0,
       request: { eventId: event.id, type: event.type, attempt: attempts },
-      response: { error: 'Database write failed', nextRetryAt, retryStrategy: 'exponential backoff' },
+      response: {
+        error: 'Database write failed',
+        nextRetryAt: dead ? undefined : nextRetryAt,
+        retryStrategy: 'exponential backoff',
+        ...(dead ? { deadLetter: true, note: 'redelivery budget exhausted — requeue manually' } : {}),
+      },
     });
     if (runId) {
       await failStep(runId, 'webhook_delivery', {
@@ -657,8 +719,9 @@ export async function processWebhook(
       body: {
         error: 'Database write failed',
         eventId: event.id,
-        nextRetryAt,
+        nextRetryAt: dead ? undefined : nextRetryAt,
         attempts,
+        ...(dead ? { deadLetter: true } : {}),
       },
     };
   }
@@ -689,20 +752,29 @@ export async function processWebhook(
 
   // ── 4 · Persist outcome ───────────────────────────────────────────────────
   if (handlerError) {
-    const backoffMs = Math.min(2000 * 2 ** (attempts - 1), 30_000);
+    const backoffMs = webhookBackoffMs(attempts);
     const nextRetryAt = new Date(Date.now() + backoffMs).toISOString();
+    // Dead-letter after the redelivery budget is spent — the event keeps its
+    // payload and delivery history for manual investigation + requeue.
+    const dead = attempts >= config.maxWebhookRedeliveries;
     await c.events.updateOne(
       { eventId: event.id } as { eventId: string },
       {
-        $set: { status: 'failed', lastError: handlerError.message, nextRetryAt },
+        $set: {
+          status: dead ? 'dead' : 'failed',
+          lastError: handlerError.message,
+          nextRetryAt: dead ? undefined : nextRetryAt,
+          ...(dead ? { deadAt: now } : {}),
+        },
         $push: { deliveries: { at: now, httpStatus, duplicate: false } },
-      },
+      } as Document,
     );
     for (const op of ops) {
-      await logDb({ runId, operation: op.operation, collection: op.collection, detail: op.detail, result: 'failed', transaction: true });
+      await logDb({ runId, correlationId, operation: op.operation, collection: op.collection, detail: op.detail, result: 'failed', transaction: true });
     }
     await logApi({
       runId,
+      correlationId,
       direction: 'inbound',
       component: 'app webhook endpoint',
       method: 'POST',
@@ -710,7 +782,11 @@ export async function processWebhook(
       statusCode: 500,
       durationMs,
       request: { eventId: event.id, type: event.type, attempt: attempts },
-      response: { error: handlerError.message, nextRetryAt },
+      response: {
+        error: handlerError.message,
+        nextRetryAt: dead ? undefined : nextRetryAt,
+        ...(dead ? { deadLetter: true, note: 'redelivery budget exhausted — requeue manually' } : {}),
+      },
     });
     if (runId) {
       await failStep(runId, 'db_transaction', { error: handlerError.message, attempt: attempts });
@@ -718,10 +794,19 @@ export async function processWebhook(
         eventId: event.id,
         statusCode: 500,
         attempt: attempts,
+        ...(dead ? { note: 'moved to dead-letter — manual requeue required' } : {}),
         deliveries: [...(await deliveryHistory(runId)), { eventId: event.id, statusCode: 500, attempt: attempts, at: now }],
       });
     }
-    return { httpStatus: 500, body: { error: handlerError.message, eventId: event.id, nextRetryAt } };
+    return {
+      httpStatus: 500,
+      body: {
+        error: handlerError.message,
+        eventId: event.id,
+        nextRetryAt: dead ? undefined : nextRetryAt,
+        ...(dead ? { deadLetter: true } : {}),
+      },
+    };
   }
 
   // Success path
@@ -735,6 +820,7 @@ export async function processWebhook(
   for (const op of ops) {
     await logDb({
       runId,
+      correlationId,
       operation: op.operation,
       collection: op.collection,
       detail: op.detail,
@@ -744,6 +830,7 @@ export async function processWebhook(
   }
   await logApi({
     runId,
+    correlationId,
     direction: 'inbound',
     component: 'app webhook endpoint',
     method: 'POST',
@@ -790,6 +877,7 @@ export async function processWebhook(
       received: true,
       duplicate: false,
       eventId: event.id,
+      signatureScheme: scheme,
       writesExecuted: writeCount(ops),
     },
   };

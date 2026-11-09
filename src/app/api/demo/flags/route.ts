@@ -23,10 +23,22 @@ export async function PUT(req: Request) {
   const denied = guardDemoRequest(req, { name: 'flags', limit: 30, windowMs: 60_000 });
   if (denied) return denied;
 
-  const body = (await req.json()) as { flag?: FlagName; enabled: boolean };
+  const body = (await req.json().catch(() => null)) as { flag?: string; enabled?: unknown } | null;
+  if (!body || typeof body.enabled !== 'boolean') {
+    return Response.json(
+      { error: 'Body must be JSON: { flag?: "db_failure" | "retry_failure", enabled: boolean }' },
+      { status: 400 },
+    );
+  }
+  if (body.flag !== undefined && body.flag !== 'db_failure' && body.flag !== 'retry_failure') {
+    return Response.json(
+      { error: `Unknown flag "${body.flag}" — allowed: db_failure, retry_failure` },
+      { status: 400 },
+    );
+  }
   // Backwards compatible: a bare { enabled } still means the db_failure flag.
   const flag: FlagName = body.flag === 'retry_failure' ? 'retry_failure' : 'db_failure';
-  const enabled = Boolean(body.enabled);
+  const enabled = body.enabled;
   await setFlag(flag, enabled);
 
   // When the operator disables the db-failure injection, mark the recovery

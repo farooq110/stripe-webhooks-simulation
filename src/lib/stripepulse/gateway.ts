@@ -12,6 +12,7 @@ import Stripe from 'stripe';
 import type { GatewayMode } from './types';
 import { nextSeq } from './mongo';
 import { webhookSecret } from './crypto';
+import { config } from './config';
 
 export interface StripeEvent {
   id: string;
@@ -49,6 +50,8 @@ export interface Gateway {
   }): Promise<CheckoutSessionResult>;
   /** Verifies a webhook signature and returns the parsed event, or throws. */
   constructWebhookEvent(payloadRaw: string, signature: string): Promise<StripeEvent>;
+  /** Live mode only: current subscription state straight from Stripe's API (null if unknown). Used by reconciliation. */
+  fetchSubscription?(subscriptionId: string): Promise<Record<string, unknown> | null>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,7 +135,14 @@ class LiveGateway implements Gateway {
   private whsec: string | undefined;
 
   constructor(secretKey: string, webhookSecret: string | undefined) {
-    this.stripe = new Stripe(secretKey);
+    // Explicit timeout and retry budget: a hung Stripe API must not hang our
+    // webhook pipeline, and transient network errors are retried inside the
+    // SDK (with exponential backoff + idempotency keys) before they ever
+    // reach our error handling.
+    this.stripe = new Stripe(secretKey, {
+      timeout: config.stripeTimeoutMs,
+      maxNetworkRetries: config.stripeMaxRetries,
+    });
     this.whsec = webhookSecret;
   }
 
@@ -179,6 +189,17 @@ class LiveGateway implements Gateway {
     }
     const evt = await this.stripe.webhooks.constructEventAsync(payloadRaw, signature, this.whsec);
     return evt as unknown as StripeEvent;
+  }
+
+  async fetchSubscription(subscriptionId: string): Promise<Record<string, unknown> | null> {
+    try {
+      const sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+      return sub as unknown as Record<string, unknown>;
+    } catch {
+      // Unknown to Stripe (deleted, wrong mode, or API error) — reconciliation
+      // treats null as "cannot verify right now", never as a drift signal.
+      return null;
+    }
   }
 }
 

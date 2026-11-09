@@ -8,6 +8,8 @@
 //   2. Rate limit — per-IP fixed window, always on. Limits are per endpoint
 //      group, so the destructive reset route can be tightened individually.
 
+import { timingSafeEqual } from 'node:crypto';
+
 const buckets = new Map<string, number[]>();
 
 const CLEANUP_EVERY_MS = 5 * 60_000;
@@ -25,8 +27,14 @@ export interface GuardOptions {
 export function guardDemoRequest(req: Request, opts: GuardOptions): Response | null {
   const token = process.env.DEMO_API_TOKEN;
   if (token) {
-    const provided = req.headers.get('x-demo-token');
-    if (provided !== token) {
+    const provided = req.headers.get('x-demo-token') ?? '';
+    // Timing-safe comparison so the token check does not leak its own
+    // contents through response-time differences. Lengths must match for
+    // timingSafeEqual; a length mismatch is rejected outright.
+    const a = Buffer.from(provided);
+    const b = Buffer.from(token);
+    const ok = a.length === b.length && timingSafeEqual(a, b);
+    if (!ok) {
       return Response.json(
         { error: 'This deployment requires the x-demo-token header on demo endpoints.' },
         { status: 401 },

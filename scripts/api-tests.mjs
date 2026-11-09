@@ -127,7 +127,7 @@ async function testDuplicate(client, sourceRunId) {
   ok('ack 200', run.steps.find((s) => s.key === 'ack_200')?.detail?.statusCode === 200);
 
   const sourceEvent = await db.collection('webhook_events').findOne({ eventId: json.eventId });
-  ok('source event marked duplicate', sourceEvent?.status === 'duplicate');
+  ok('source event keeps its processed status (a redelivery never rewrites history)', sourceEvent?.status === 'processed', `status=${sourceEvent?.status}`);
   ok('duplicate delivery recorded on event', (sourceEvent?.deliveries ?? []).some((d) => d.duplicate === true && d.httpStatus === 200));
 
   const subsAfter = await db.collection('subscriptions').countDocuments();

@@ -110,10 +110,12 @@ The app exposes:
 | `GET /api/health` | MongoDB status, gateway mode, version. Use this in scripts to check the app is alive. |
 | `POST /api/webhooks/stripe` | The webhook receiver. Verifies signatures, dedups events, runs transactions. |
 | `POST /api/demo/checkout`, `/api/demo/scenarios/payment-retry`, `/api/demo/scenarios/duplicate`, `/api/demo/scenarios/db-failure` | Start each scenario. |
-| `POST /api/demo/cancel` | Cancel a subscription through the real pipeline. |
+| `POST /api/demo/cancel` | Cancel a subscription through the real pipeline. Body options: `{}` or `{ subscriptionId }` = immediate cancel; `{ subscriptionId, atPeriodEnd: true }` = cancel at the end of the current billing period (the subscription stays active until then, exactly like Stripe); `{ subscriptionId, action: "reverse" }` = reverse a pending period-end cancellation. |
 | `POST /api/demo/flags` | Turn failure injection on/off. |
 | `POST /api/demo/tick` | Force a scheduler tick. |
-| `POST /api/demo/reset` | Wipe the demo environment. |
+| `POST /api/demo/requeue` | Manually requeue a dead-lettered or failed webhook event: `{ eventId: "evt_..." }`. |
+| `POST /api/demo/reconcile` | Run the Stripe ↔ MongoDB reconciliation now and get the report (drift detected, repairs applied). The scheduler also runs it automatically (see `RECONCILE_INTERVAL_MS` in SETUP.md). |
+| `POST /api/demo/reset` | Wipe the demo environment. `GET /api/demo/reset` previews exactly what would be deleted. In live mode, records created by the real Stripe gateway are preserved. |
 | `GET /api/runs/[id]` | Full detail of one run: steps, events, logs. |
 | `GET /api/state` | Everything the dashboard needs, in one call. |
 

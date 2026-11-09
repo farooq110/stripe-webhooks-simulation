@@ -35,7 +35,7 @@ export async function getAppState(): Promise<AppStatePayload> {
   const c = collections(db);
   const gateway = getGateway();
 
-  const [mongo, dbFailure, retryFailure, plans, subscriptions, attempts, recentEvents, runs, processed, failed, dupes] =
+  const [mongo, dbFailure, retryFailure, plans, subscriptions, attempts, recentEvents, runs, processed, failed, dupes, dead, jobsScheduled, jobsRunning, jobsExhausted, jobsDone] =
     await Promise.all([
       mongoHealth(),
       getFlag('db_failure'),
@@ -48,6 +48,11 @@ export async function getAppState(): Promise<AppStatePayload> {
       c.events.countDocuments({ status: 'processed' } as Document),
       c.events.countDocuments({ status: 'failed' } as Document),
       c.dbLogs.countDocuments({ result: 'read-only', operation: 'findUnique' } as Document),
+      c.events.countDocuments({ status: 'dead' } as Document),
+      c.retryJobs.countDocuments({ status: 'scheduled' } as Document),
+      c.retryJobs.countDocuments({ status: 'running' } as Document),
+      c.retryJobs.countDocuments({ status: 'exhausted' } as Document),
+      c.retryJobs.countDocuments({ status: 'done' } as Document),
     ]);
 
   const active = subscriptions.filter((s) => s.status === 'active' || s.status === 'trialing');
@@ -62,12 +67,21 @@ export async function getAppState(): Promise<AppStatePayload> {
     attempts: attempts as unknown as AppStatePayload['attempts'],
     recentEvents: recentEvents as unknown as AppStatePayload['recentEvents'],
     runs: runs as unknown as AppStatePayload['runs'],
+    retryQueue: {
+      scheduled: jobsScheduled,
+      running: jobsRunning,
+      exhausted: jobsExhausted,
+      done: jobsDone,
+      dead,
+      failedEvents: failed,
+    },
     stats: {
       activeSubscriptions: active.length,
       mrr,
       eventsProcessed: processed,
       eventsFailed: failed,
       duplicatesBlocked: dupes,
+      deadLettered: dead,
     },
   };
 }

@@ -71,12 +71,14 @@ export interface WebhookEventDoc {
   runId?: string;
   type: string;
   payloadRaw: string;
-  status: 'received' | 'processing' | 'processed' | 'failed' | 'duplicate';
+  status: 'received' | 'processing' | 'processed' | 'failed' | 'duplicate' | 'dead';
   attempts: number;
   lastError?: string;
   nextRetryAt?: string;
   signatureVerified: boolean;
-  deliveries: { at: string; httpStatus: number; duplicate: boolean }[];
+  signatureScheme?: 'stripe-sdk' | 'sim-hmac';
+  deliveries: { at: string; httpStatus: number; duplicate: boolean; mirrored?: boolean; manual?: boolean }[];
+  deadAt?: string;
   createdAt: string;
   processedAt?: string;
 }
@@ -142,6 +144,10 @@ export interface SubscriptionDoc {
     | 'unpaid';
   currentPeriodStart: string;
   currentPeriodEnd: string;
+  /** True when a cancellation is scheduled for the end of the current period (Stripe: cancel_at_period_end). */
+  cancelAtPeriodEnd?: boolean;
+  /** When the scheduled cancellation takes effect (Stripe: cancel_at). */
+  cancelAt?: string;
   canceledAt?: string;
   createdAt: string;
   updatedAt: string;
@@ -201,11 +207,20 @@ export interface AppStatePayload {
   attempts: PaymentAttemptDoc[];
   recentEvents: WebhookEventDoc[];
   runs: RunDoc[];
+  retryQueue: {
+    scheduled: number;
+    running: number;
+    exhausted: number;
+    done: number;
+    dead: number;
+    failedEvents: number;
+  };
   stats: {
     activeSubscriptions: number;
     mrr: number;
     eventsProcessed: number;
     eventsFailed: number;
     duplicatesBlocked: number;
+    deadLettered: number;
   };
 }

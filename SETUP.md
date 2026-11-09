@@ -75,8 +75,18 @@ All of these are optional. Copy `.env.example` to `.env` and change what you nee
 | `STRIPE_WEBHOOK_SECRET` | — | Signing secret for live webhook verification (the `whsec_...` from `stripe listen`). |
 | `STRIPE_SIM_WEBHOOK_SECRET` | random per start | Signing secret used by the simulator. If you leave it empty the app generates a random one each start — safe, but you can't sign test webhooks from scripts. Set your own random value (e.g. `openssl rand -hex 32`) to run `scripts/api-tests.mjs` and `scripts/reliability-tests.mjs`. |
 | `APP_URL` | `http://127.0.0.1:3000` | Used for checkout success/cancel redirect URLs. |
-| `DEMO_API_TOKEN` | — | Optional. If set, every `/api/demo/*` endpoint requires the header `x-demo-token: <value>`. Use this on public deployments; the dashboard buttons will then only work for scripts that send the header. |
+| `DEMO_API_TOKEN` | — | Optional. If set, every mutating `/api/demo/*` endpoint requires the header `x-demo-token: <value>`. Use this on public deployments; the dashboard buttons will then only work for scripts that send the header. |
 | `MAX_PAYMENT_RETRIES` | `3` | How many smart-retry attempts before the subscription is marked `unpaid`. |
+| `PAYMENT_RETRY_BACKOFF_MS` | `6000` | Base delay between dunning attempts (exponential ladder). |
+| `WEBHOOK_MAX_REDELIVERIES` | `6` | Redeliveries before a failing event moves to the dead-letter state (`dead`), where it waits for `POST /api/demo/requeue { eventId }`. |
+| `WEBHOOK_BACKOFF_BASE_MS` | `2000` | Webhook redelivery backoff base: `base × 2^(attempt−1)`. |
+| `WEBHOOK_BACKOFF_MAX_MS` | `30000` | Ceiling for the webhook backoff ladder. |
+| `WEBHOOK_CLAIM_TTL_MS` | `30000` | How long a processing claim stays valid before a crashed worker's event or retry job is reclaimed. |
+| `WEBHOOK_SIBLING_WAIT_MS` | `12000` | How long a concurrent delivery of the same event waits for the worker holding the claim. |
+| `WEBHOOK_TOLERANCE_SECONDS` | `300` | Webhook signature timestamp tolerance. |
+| `RECONCILE_INTERVAL_MS` | `60000` | How often the Stripe ↔ MongoDB reconciliation runs. `0` disables it. It compares every local subscription with its source of truth (Stripe API in live mode, the processed event log in simulated mode) and repairs drift. Also available on demand: `POST /api/demo/reconcile`. |
+| `STRIPE_API_TIMEOUT_MS` | `15000` | Per-call timeout for live Stripe API requests. |
+| `STRIPE_API_MAX_RETRIES` | `2` | SDK-level network retries for live Stripe API calls. |
 
 Note: the MongoDB connection is hardcoded to `127.0.0.1:27017` (database name `stripepulse`, replica set `rs0`) — see the top of `src/lib/stripepulse/mongo.ts`. Change it there if you need a different host.
 
@@ -85,8 +95,10 @@ Note: the MongoDB connection is hardcoded to `127.0.0.1:27017` (database name `s
 ```bash
 npm run lint                 # should pass with no errors
 npm run build                # production build, type checking on
-bash scripts/run-with-server.sh node scripts/api-tests.mjs    # 52 assertions
-bash scripts/run-with-server.sh node scripts/reliability-tests.mjs  # 26 reliability checks
+bash scripts/run-with-server.sh node scripts/api-tests.mjs           # 52 assertions
+bash scripts/run-with-server.sh node scripts/reliability-tests.mjs   # 43 reliability checks
+bash scripts/run-with-server.sh node scripts/hardening-tests.mjs     # 64 hardening checks (signatures, idempotency, dead-letter, cancellation lifecycle, reconciliation, reset safety)
+node scripts/security-tests.mjs   # 26 auth checks — stops the dev server and runs its own with DEMO_API_TOKEN set
 npx playwright test          # 11 UI tests (app must be running; first time: npx playwright install)
 ```
 

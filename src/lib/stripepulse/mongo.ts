@@ -106,12 +106,18 @@ async function ensureSchema(db: Db): Promise<void> {
   await db.collection('run_steps').createIndex({ runId: 1, idx: 1 });
   await db.collection('webhook_events').createIndex({ eventId: 1 }, { unique: true });
   await db.collection('webhook_events').createIndex({ status: 1, nextRetryAt: 1 });
+  await db.collection('webhook_events').createIndex({ runId: 1, createdAt: 1 });
   await db.collection('subscriptions').createIndex({ subscriptionId: 1 }, { unique: true });
+  await db.collection('subscriptions').createIndex({ runId: 1 });
   await db.collection('customers').createIndex({ customerId: 1 }, { unique: true });
   await db.collection('api_logs').createIndex({ runId: 1, createdAt: 1 });
   await db.collection('db_logs').createIndex({ runId: 1, createdAt: 1 });
   await db.collection('payment_attempts').createIndex({ runId: 1, createdAt: 1 });
+  // Latest-attempt lookups for the delayed-recovery check and reconciliation.
+  await db.collection('payment_attempts').createIndex({ subscriptionId: 1, attempt: -1 });
   await db.collection('retry_jobs').createIndex({ status: 1, nextRetryAt: 1 });
+  // Stale-claim reclaim sweeps (jobs whose worker died mid-flight).
+  await db.collection('retry_jobs').createIndex({ claimedAt: 1 });
 
   // Seed plans (idempotent)
   const plans = collections(db).plans;
@@ -196,13 +202,15 @@ export interface EventRecord {
   runId?: string;
   type: string;
   payloadRaw: string;
-  status: 'processing' | 'processed' | 'failed' | 'duplicate' | 'received';
+  status: 'processing' | 'processed' | 'failed' | 'duplicate' | 'received' | 'dead';
   attempts: number;
   signatureVerified: boolean;
-  deliveries: { at: string; httpStatus: number; duplicate: boolean; mirrored?: boolean }[];
+  signatureScheme?: 'stripe-sdk' | 'sim-hmac';
+  deliveries: { at: string; httpStatus: number; duplicate: boolean; mirrored?: boolean; manual?: boolean }[];
   claimExpiresAt?: string;
   lastError?: string;
   nextRetryAt?: string;
+  deadAt?: string;
   processedAt?: string;
   createdAt: string;
 }

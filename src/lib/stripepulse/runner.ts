@@ -19,6 +19,8 @@ import {
   invoicePaymentFailed,
   paymentIntentSucceeded,
   subMetaFromSession,
+  subscriptionCancelReversed,
+  subscriptionCancelScheduled,
   subscriptionCreated,
   subscriptionDeleted,
   subscriptionUpdated,
@@ -565,10 +567,81 @@ export async function startDbFailureRun(): Promise<{ runId: string; eventId: str
   return { runId: run._id, eventId: evt.id };
 }
 
-// ─── Scenario 5 · cancel_subscription ───────────────────────────────────────
+// ─── Scenario 5 · cancel_subscription (immediate / at period end / reversal)
+
+function cancelMeta(run: RunDoc, sub: SubscriptionDoc): SubMeta {
+  return {
+    runId: run._id,
+    subscriptionId: sub.subscriptionId,
+    customerId: sub.customerId,
+    customerEmail: sub.customerEmail,
+    planId: sub.priceId,
+    planName: sub.planName,
+    amount: sub.amount,
+    currency: sub.currency,
+  };
+}
+
+// Shared tail of every cancellation run: deliver the event, record the
+// pipeline steps, verify what the webhook actually committed, finish honestly.
+async function finishCancelRun(
+  run: RunDoc,
+  sub: SubscriptionDoc,
+  evt: Awaited<ReturnType<typeof subscriptionDeleted>>,
+  expect: { status: 'canceled' } | { status: 'active'; cancelAtPeriodEnd: boolean },
+  actionLabel: string,
+): Promise<{ runId: string; subscriptionId: string }> {
+  const db = await getDb();
+  const c = collections(db);
+  const res = await dispatchWebhook(evt, run._id);
+  const body = res.body as { received?: boolean; duplicate?: boolean };
+
+  await completeStep(run._id, 'webhook_delivery', {
+    eventId: evt.id,
+    type: evt.type,
+    statusCode: res.httpStatus,
+  });
+  await completeStep(run._id, 'signature_verified', {
+    verified: true,
+    algorithm: 'HMAC-SHA256',
+    eventId: evt.id,
+  });
+  await completeStep(run._id, 'dedup_check', {
+    result: body.duplicate ? 'duplicate blocked' : 'new event',
+    eventId: evt.id,
+    guard: 'unique index webhook_events.eventId',
+  });
+
+  const fresh = (await c.subscriptions.findOne({
+    subscriptionId: sub.subscriptionId,
+  } as { subscriptionId: string })) as unknown as SubscriptionDoc | null;
+
+  const ok = fresh
+    && (expect.status === 'canceled'
+      ? fresh.status === 'canceled'
+      : fresh.status === expect.status && (fresh.cancelAtPeriodEnd ?? false) === expect.cancelAtPeriodEnd);
+
+  if (!ok || res.httpStatus !== 200 || body.duplicate) {
+    await failStep(run._id, 'db_transaction', {
+      error: `expected ${expect.status}${'cancelAtPeriodEnd' in expect ? ` with cancelAtPeriodEnd=${expect.cancelAtPeriodEnd}` : ''}, got ${fresh?.status ?? 'unknown'} (endpoint ${res.httpStatus})`,
+      endpointResponse: res.body,
+    });
+    await finishRun(run._id, 'failed');
+    throw new Error(`${actionLabel} did not commit (run ${run._id}, subscription status: ${fresh?.status ?? 'unknown'})`);
+  }
+
+  await completeStep(run._id, 'db_transaction', {
+    transaction: 'MongoDB multi-document ACID (replica set rs0)',
+    writes: [`update subscriptions: ${sub.subscriptionId} · status=${fresh.status}${fresh.cancelAtPeriodEnd ? ' · cancelAtPeriodEnd=true' : ''}`],
+    committed: true,
+  });
+
+  await finishRun(run._id, 'completed');
+  return { runId: run._id, subscriptionId: sub.subscriptionId };
+}
 
 export async function startCancelRun(
-  input?: { subscriptionId?: string },
+  input?: { subscriptionId?: string; atPeriodEnd?: boolean },
 ): Promise<{ runId: string; subscriptionId: string }> {
   const db = await getDb();
   const c = collections(db);
@@ -586,6 +659,53 @@ export async function startCancelRun(
   if (!sub) throw new Error('Could not find a subscription to cancel');
   if (sub.status === 'canceled') throw new Error(`Subscription ${sub.subscriptionId} is already canceled`);
 
+  const atPeriodEnd = Boolean(input?.atPeriodEnd);
+  if (atPeriodEnd && sub.cancelAtPeriodEnd) {
+    throw new Error(`Subscription ${sub.subscriptionId} is already scheduled to cancel at period end`);
+  }
+
+  const run = await createRun(
+    'cancel_subscription',
+    { id: sub.priceId, planName: sub.planName, amount: sub.amount, currency: sub.currency },
+    { email: sub.customerEmail, name: sub.customerEmail.split('@')[0] },
+  );
+  await c.runs.updateOne({ _id: run._id } as { _id: string }, {
+    $set: { customerId: sub.customerId, subscriptionId: sub.subscriptionId },
+  });
+
+  await completeStep(run._id, 'cancel_requested', {
+    subscriptionId: sub.subscriptionId,
+    previousStatus: sub.status,
+    atPeriodEnd,
+    // Stripe keeps the subscription active until the period ends when the
+    // customer asks for period-end cancellation.
+    ...(atPeriodEnd ? { stripeSemantics: 'subscription stays active until current_period_end, then customer.subscription.deleted' } : {}),
+  });
+
+  const meta = cancelMeta(run, sub);
+  const evt = atPeriodEnd
+    ? await subscriptionCancelScheduled(meta, sub.currentPeriodStart, sub.currentPeriodEnd)
+    : await subscriptionDeleted(meta, sub.currentPeriodStart, sub.currentPeriodEnd);
+
+  return finishCancelRun(run, sub, evt, atPeriodEnd
+    ? { status: 'active', cancelAtPeriodEnd: true }
+    : { status: 'canceled' }, atPeriodEnd ? 'Period-end cancellation schedule' : 'Cancellation');
+}
+
+/** Reverses a pending period-end cancellation (customer changed their mind). */
+export async function startCancelReversalRun(
+  input?: { subscriptionId?: string },
+): Promise<{ runId: string; subscriptionId: string }> {
+  const db = await getDb();
+  const c = collections(db);
+  ensureScheduler();
+
+  const sub = input?.subscriptionId
+    ? ((await c.subscriptions.findOne({ subscriptionId: input.subscriptionId } as { subscriptionId: string })) as unknown as SubscriptionDoc | null)
+    : ((await c.subscriptions.find({ cancelAtPeriodEnd: true } as Document).sort({ createdAt: -1 }).limit(1).next()) as unknown as SubscriptionDoc | null);
+  if (!sub) throw new Error('No subscription with a pending period-end cancellation to reverse');
+  if (!sub.cancelAtPeriodEnd) throw new Error(`Subscription ${sub.subscriptionId} has no pending period-end cancellation`);
+
   const run = await createRun(
     'cancel_subscription',
     { id: sub.priceId, planName: sub.planName, amount: sub.amount, currency: sub.currency },
@@ -599,59 +719,46 @@ export async function startCancelRun(
     subscriptionId: sub.subscriptionId,
     previousStatus: sub.status,
     atPeriodEnd: false,
+    action: 'reverse',
+    note: 'operator reversed the pending period-end cancellation',
   });
 
-  const meta: SubMeta = {
-    runId: run._id,
+  const meta = cancelMeta(run, sub);
+  const evt = await subscriptionCancelReversed(meta, sub.currentPeriodStart, sub.currentPeriodEnd);
+  return finishCancelRun(run, sub, evt, { status: 'active', cancelAtPeriodEnd: false }, 'Cancellation reversal');
+}
+
+/**
+ * Fires when a flagged subscription's period actually ends (scheduler sweep):
+ * emits customer.subscription.deleted through the real pipeline, exactly like
+ * Stripe does at period end.
+ */
+export async function runPeriodEndCancellation(
+  sub: SubscriptionDoc,
+): Promise<{ runId: string; subscriptionId: string }> {
+  const db = await getDb();
+  const c = collections(db);
+
+  const run = await createRun(
+    'cancel_subscription',
+    { id: sub.priceId, planName: sub.planName, amount: sub.amount, currency: sub.currency },
+    { email: sub.customerEmail, name: sub.customerEmail.split('@')[0] },
+  );
+  await c.runs.updateOne({ _id: run._id } as { _id: string }, {
+    $set: { customerId: sub.customerId, subscriptionId: sub.subscriptionId },
+  });
+
+  await completeStep(run._id, 'cancel_requested', {
     subscriptionId: sub.subscriptionId,
-    customerId: sub.customerId,
-    customerEmail: sub.customerEmail,
-    planId: sub.priceId,
-    planName: sub.planName,
-    amount: sub.amount,
-    currency: sub.currency,
-  };
+    previousStatus: sub.status,
+    atPeriodEnd: true,
+    action: 'period_ended',
+    note: 'billing period ended while cancel_at_period_end was set — cancellation took effect',
+  });
 
-  // Stripe emits customer.subscription.deleted when a cancellation takes effect.
+  const meta = cancelMeta(run, sub);
   const evt = await subscriptionDeleted(meta, sub.currentPeriodStart, sub.currentPeriodEnd);
-  const res = await dispatchWebhook(evt, run._id);
-  const body = res.body as { received?: boolean; duplicate?: boolean };
-
-  await completeStep(run._id, 'webhook_delivery', {
-    eventId: evt.id,
-    type: 'customer.subscription.deleted',
-    statusCode: res.httpStatus,
-  });
-  await completeStep(run._id, 'signature_verified', {
-    verified: true,
-    algorithm: 'HMAC-SHA256',
-    eventId: evt.id,
-  });
-  await completeStep(run._id, 'dedup_check', {
-    result: body.duplicate ? 'duplicate blocked' : 'new event',
-    eventId: evt.id,
-    guard: 'unique index webhook_events.eventId',
-  });
-
-  const fresh = await c.subscriptions.findOne({ subscriptionId: sub.subscriptionId } as { subscriptionId: string });
-  if (res.httpStatus !== 200 || body.duplicate || fresh?.status !== 'canceled') {
-    // Record honestly if the cancellation did not commit.
-    await failStep(run._id, 'db_transaction', {
-      error: `expected status canceled, got ${fresh?.status ?? 'unknown'} (endpoint ${res.httpStatus})`,
-      endpointResponse: res.body,
-    });
-    await finishRun(run._id, 'failed');
-    throw new Error(`Cancellation did not commit (run ${run._id}, subscription status: ${fresh?.status ?? 'unknown'})`);
-  }
-
-  await completeStep(run._id, 'db_transaction', {
-    transaction: 'MongoDB multi-document ACID (replica set rs0)',
-    writes: [`update subscriptions: ${sub.subscriptionId} · status=canceled`],
-    committed: true,
-  });
-
-  await finishRun(run._id, 'completed');
-  return { runId: run._id, subscriptionId: sub.subscriptionId };
+  return finishCancelRun(run, sub, evt, { status: 'canceled' }, 'Period-end cancellation');
 }
 
 // ─── Duplicate run of markStep for live mode helper (unused for now) ────────

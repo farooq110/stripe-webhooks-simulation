@@ -16,17 +16,13 @@ import { simId } from './gateway';
 import { collections, getDb, getFlag } from './mongo';
 import { dispatchWebhook } from './dispatcher';
 import { completeStep, failStep, finishRun, logApi, markStep } from './recorder';
+import { config } from './config';
+import { runReconciliation, type ReconciliationReport } from './reconciler';
 import { invoicePaid, invoicePaymentFailed, paymentIntentSucceeded, subscriptionUpdated, type SubMeta } from './events';
 
 const g = globalThis as unknown as { __sp_scheduler?: NodeJS.Timeout };
 
 const TICK_MS = 1500;
-
-// How many dunning attempts before giving up and marking the subscription
-// 'unpaid'. Read from the environment so the limit is configurable and can
-// be demonstrated quickly without waiting through long backoffs.
-const MAX_PAYMENT_RETRIES = Number(process.env.MAX_PAYMENT_RETRIES ?? 3);
-const PAYMENT_RETRY_BACKOFF_MS = 6000;
 
 const nowIso = () => new Date().toISOString();
 
@@ -39,7 +35,14 @@ export function ensureScheduler(): void {
   g.__sp_scheduler.unref?.();
 }
 
-export async function tick(): Promise<{ redelivered: number; paymentRetries: number; reclaimed: number }> {
+export async function tick(): Promise<{
+  redelivered: number;
+  paymentRetries: number;
+  reclaimed: number;
+  staleJobsReclaimed?: number;
+  periodEndCancellations?: number;
+  reconciliation?: ReconciliationReport;
+}> {
   const db = await getDb();
   const c = collections(db);
   const now = nowIso();
@@ -62,6 +65,19 @@ export async function tick(): Promise<{ redelivered: number; paymentRetries: num
     } as Document,
   );
   reclaimed = stuck.modifiedCount;
+
+  // Same sweep for dunning jobs: a worker that claimed a job and died would
+  // otherwise leave it in 'running' forever. The claim TTL matches the
+  // webhook one — after it passes the job goes back to 'scheduled'.
+  const staleClaimCutoff = new Date(Date.now() - config.claimTtlMs).toISOString();
+  const staleJobs = await c.retryJobs.updateMany(
+    { status: 'running', claimedAt: { $lt: staleClaimCutoff } } as Document,
+    {
+      $set: { status: 'scheduled', nextRetryAt: now },
+      $unset: { claimedAt: '' },
+    } as Document,
+  );
+  const staleJobsReclaimed = staleJobs.modifiedCount;
 
   // ── 1 · Webhook redeliveries (event.status = failed, backoff elapsed) ────
   const dueEvents = await c.events
@@ -132,7 +148,51 @@ export async function tick(): Promise<{ redelivered: number; paymentRetries: num
     await processPaymentRetry(claimed as unknown as RetryJobLike);
   }
 
-  return { redelivered, paymentRetries, reclaimed };
+  // ── 3 · Period-end cancellation transitions (Stripe semantics) ───────────
+  // A subscription flagged cancel_at_period_end stays active until the period
+  // actually ends. Stripe then emits customer.subscription.deleted — we do
+  // the same here, through the real webhook pipeline (signature, dedup,
+  // transaction), so the local state transitions exactly like Stripe's.
+  let periodEndCancellations = 0;
+  const dueCancels = await c.subscriptions
+    .find({
+      cancelAtPeriodEnd: true,
+      status: { $in: ['active', 'trialing', 'past_due'] },
+      currentPeriodEnd: { $lte: now },
+    } as Document)
+    .limit(5)
+    .toArray();
+  if (dueCancels.length > 0) {
+    // Dynamic import keeps the scheduler ↔ runner cycle lazy.
+    const { runPeriodEndCancellation } = await import('./runner');
+    for (const sub of dueCancels) {
+      try {
+        await runPeriodEndCancellation(sub as unknown as Parameters<typeof runPeriodEndCancellation>[0]);
+        periodEndCancellations++;
+      } catch {
+        // The deleted event went through the normal pipeline — on failure it
+        // lands in the redelivery queue and the sweep picks it up next tick.
+      }
+    }
+  }
+
+  // ── 4 · Periodic Stripe ↔ MongoDB reconciliation ─────────────────────────
+  let reconciliation: ReconciliationReport | undefined;
+  if (config.reconcileIntervalMs > 0) {
+    const gRecon = globalThis as unknown as { __sp_last_reconcile_at?: number };
+    const last = gRecon.__sp_last_reconcile_at ?? 0;
+    if (Date.now() - last >= config.reconcileIntervalMs) {
+      gRecon.__sp_last_reconcile_at = Date.now();
+      try {
+        reconciliation = await runReconciliation();
+      } catch {
+        // Reconciliation must never break the scheduler loop; the next
+        // interval retries.
+      }
+    }
+  }
+
+  return { redelivered, paymentRetries, reclaimed, staleJobsReclaimed, periodEndCancellations, reconciliation };
 }
 
 interface RetryJobLike {
@@ -210,7 +270,7 @@ async function processPaymentRetry(job: RetryJobLike): Promise<void> {
       code: 'card_declined',
       httpStatus: 402,
       message: 'Your card was declined.',
-      note: `retry ${job.attempts} of max ${MAX_PAYMENT_RETRIES}`,
+      note: `retry ${job.attempts} of max ${config.maxPaymentRetries}`,
       paymentIntentId: piId,
     });
 
@@ -224,7 +284,7 @@ async function processPaymentRetry(job: RetryJobLike): Promise<void> {
     });
     await dispatchWebhook(evtFailed, job.runId);
 
-    if (job.attempts >= MAX_PAYMENT_RETRIES) {
+    if (job.attempts >= config.maxPaymentRetries) {
       // Dunning gave up — mirror Stripe: the subscription ends up unpaid.
       await c.retryJobs.updateOne({ _id: job._id } as { _id: string }, {
         $set: { status: 'exhausted', finishedAt: nowIso(), note: `no recovery after ${job.attempts} retries` },
@@ -242,7 +302,7 @@ async function processPaymentRetry(job: RetryJobLike): Promise<void> {
     }
 
     // Still attempts left — reschedule with the same backoff ladder.
-    const nextRetryAt = new Date(Date.now() + PAYMENT_RETRY_BACKOFF_MS * 2 ** (job.attempts - 1)).toISOString();
+    const nextRetryAt = new Date(Date.now() + config.paymentRetryBackoffMs * 2 ** (job.attempts - 1)).toISOString();
     await c.retryJobs.updateOne({ _id: job._id } as { _id: string }, {
       $set: { status: 'scheduled', nextRetryAt, lastError: `retry ${job.attempts} declined` },
     } as Document);
@@ -314,7 +374,7 @@ async function processPaymentRetry(job: RetryJobLike): Promise<void> {
       result: 'recovery not applied',
     });
 
-    if (job.attempts >= MAX_PAYMENT_RETRIES) {
+    if (job.attempts >= config.maxPaymentRetries) {
       // Give up honestly. The charge log said succeeded but the app could not
       // record it — do NOT fabricate an 'unpaid' transition here. The failed
       // invoice.paid event stays in the redelivery queue and can still
@@ -332,7 +392,7 @@ async function processPaymentRetry(job: RetryJobLike): Promise<void> {
     }
 
     // Still attempts left — reschedule instead of marking done (HIGH-1).
-    const nextRetryAt = new Date(Date.now() + PAYMENT_RETRY_BACKOFF_MS * 2 ** (job.attempts - 1)).toISOString();
+    const nextRetryAt = new Date(Date.now() + config.paymentRetryBackoffMs * 2 ** (job.attempts - 1)).toISOString();
     await c.retryJobs.updateOne({ _id: job._id } as { _id: string }, {
       $set: { status: 'scheduled', nextRetryAt, lastError: `recovery webhook answered ${r1.httpStatus}` },
     } as Document);

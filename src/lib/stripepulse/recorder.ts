@@ -80,6 +80,8 @@ export async function blockStep(runId: string, key: string, detail?: StepDetail)
 
 export async function logApi(entry: {
   runId?: string;
+  /** Correlation id — the Stripe event id ties every log line of one webhook processing together. */
+  correlationId?: string;
   direction: 'outbound' | 'inbound';
   component: string;
   method: string;
@@ -97,6 +99,7 @@ export async function logApi(entry: {
 
 export async function logDb(entry: {
   runId?: string;
+  correlationId?: string;
   operation: string;
   collection: string;
   detail: string;

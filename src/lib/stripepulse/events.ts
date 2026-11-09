@@ -106,6 +106,45 @@ export function subscriptionDeleted(m: SubMeta, periodStartIso: string, periodEn
   });
 }
 
+// ── Cancellation lifecycle (Stripe semantics) ────────────────────────────────
+// Stripe does not cancel immediately when a user asks for period-end
+// cancellation. It keeps the subscription 'active', sets
+// cancel_at_period_end=true (plus cancel_at) and emits
+// customer.subscription.updated. At the end of the period it emits
+// customer.subscription.deleted. If the customer changes their mind, another
+// updated event flips cancel_at_period_end back to false and clears
+// cancel_at/canceled_at.
+
+/** The operator scheduled a cancellation for the end of the current period. */
+export function subscriptionCancelScheduled(
+  m: SubMeta,
+  periodStartIso: string,
+  periodEndIso: string,
+) {
+  const base = subFields(m, 'active', periodStartIso, periodEndIso);
+  return buildEvent('customer.subscription.updated', {
+    ...base,
+    cancel_at_period_end: true,
+    cancel_at: Math.floor(new Date(periodEndIso).getTime() / 1000),
+    canceled_at: Math.floor(Date.now() / 1000),
+  });
+}
+
+/** The operator reversed a pending period-end cancellation. */
+export function subscriptionCancelReversed(
+  m: SubMeta,
+  periodStartIso: string,
+  periodEndIso: string,
+) {
+  const base = subFields(m, 'active', periodStartIso, periodEndIso);
+  return buildEvent('customer.subscription.updated', {
+    ...base,
+    cancel_at_period_end: false,
+    cancel_at: null,
+    canceled_at: null,
+  });
+}
+
 export function invoiceObject(m: SubMeta, opts: {
   invoiceId: string;
   paymentIntentId: string;
