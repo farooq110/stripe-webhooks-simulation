@@ -20,7 +20,7 @@ import { collections, getDb, getFlag } from './mongo';
 import { getGateway, type StripeEvent } from './gateway';
 import { verifySignature } from './crypto';
 import { config, webhookBackoffMs } from './config';
-import { completeStep, failStep, logApi, logDb } from './recorder';
+import { completeStep, failStep, finishRun, logApi, logDb } from './recorder';
 
 export const WEBHOOK_PATH = '/api/webhooks/stripe';
 
@@ -868,6 +868,20 @@ export async function processWebhook(
         committed: true,
         eventId: event.id,
       });
+    }
+  }
+
+  // A live checkout run has no in-app confirm step — the run is done once the
+  // real checkout.session.completed webhook carrying its run_id is processed
+  // (QA Round-3 LOW-NEW-3: live runs used to stay 'running' forever). Sim
+  // runs finalize inside confirmCheckout instead, so this only ever fires
+  // for run rows created by the live gateway.
+  if (runId && event.type === 'checkout.session.completed') {
+    const run = (await c.runs.findOne({ _id: runId } as { _id: string })) as unknown as
+      | { mode?: string; status?: string }
+      | null;
+    if (run?.mode === 'live' && run.status === 'running') {
+      await finishRun(runId, 'completed');
     }
   }
 

@@ -349,6 +349,88 @@ async function main() {
   ok('demo data wiped', stateAfterReset?.runs?.length === 0 && stateAfterReset?.subscriptions?.length === 0);
   ok('reset notes gateway-mode protection', typeof doReset.json?.protectedLiveRecords === 'boolean');
 
+  // ── 13 · Live-run finalization (QA Round-3 LOW-NEW-3) ─────────────────────
+  // A live checkout run has no in-app confirm step. When the real
+  // checkout.session.completed webhook carrying the run's metadata.run_id is
+  // processed, the run must leave 'running'. The gateway stays in sim mode
+  // here — the finalizer keys on the RUN's recorded mode, not the gateway's —
+  // so the scenario is exercisable without network access.
+  console.log('\n■ 13 · Live checkout run finalizes when its webhook is processed');
+  await mclient.db().collection('runs').insertOne({
+    _id: 'run_hardening_livefin',
+    scenario: 'checkout_success',
+    mode: 'live',
+    status: 'running',
+    planId: 'price_team_monthly',
+    planName: 'Team',
+    amount: 4900,
+    currency: 'usd',
+    customerEmail: 'live.fin@stripepulse.dev',
+    customerName: 'Live Fin',
+    createdAt: new Date().toISOString(),
+  });
+  const liveSession = {
+    id: 'cs_test_hardening_livefin',
+    object: 'checkout.session',
+    amount_subtotal: 4900,
+    amount_total: 4900,
+    currency: 'usd',
+    customer: 'cus_test_hardening_livefin',
+    customer_email: 'live.fin@stripepulse.dev',
+    livemode: false,
+    mode: 'subscription',
+    payment_status: 'paid',
+    status: 'complete',
+    subscription: 'sub_test_hardening_livefin',
+    metadata: {
+      run_id: 'run_hardening_livefin',
+      customer_id: 'cus_test_hardening_livefin',
+      customer_email: 'live.fin@stripepulse.dev',
+      customer_name: 'Live Fin',
+      price_id: 'price_team_monthly',
+      plan_name: 'Team',
+      amount: '4900',
+      currency: 'usd',
+    },
+  };
+  const liveFinRes = await deliver(buildEvent('checkout.session.completed', liveSession));
+  ok('live checkout.session.completed accepted', liveFinRes.status === 200, JSON.stringify(liveFinRes.json));
+  await waitFor(
+    async () => (await mclient.db().collection('runs').findOne({ _id: 'run_hardening_livefin' }))?.status === 'completed',
+    15000,
+    400,
+    'live run completion',
+  );
+  ok('live run left running after its webhook was processed', true);
+  const liveFinSub = await mclient.db().collection('subscriptions').findOne({ subscriptionId: 'sub_test_hardening_livefin' });
+  ok('live run webhook also produced the subscription row', Boolean(liveFinSub));
+  // Sim runs must keep finalizing through confirmCheckout (which completes
+  // them at the right point of the in-app flow) — the webhook finalizer is a
+  // no-op for them.
+  await mclient.db().collection('runs').insertOne({
+    _id: 'run_hardening_simfin',
+    scenario: 'checkout_success',
+    mode: 'simulated',
+    status: 'running',
+    planId: 'price_pro_monthly',
+    planName: 'Pro',
+    amount: 1900,
+    currency: 'usd',
+    customerEmail: 'sim.fin@stripepulse.dev',
+    customerName: 'Sim Fin',
+    createdAt: new Date().toISOString(),
+  });
+  const simSession = { ...liveSession, id: 'cs_test_hardening_simfin', metadata: { ...liveSession.metadata, run_id: 'run_hardening_simfin' } };
+  const simFinRes = await deliver(buildEvent('checkout.session.completed', simSession));
+  ok('sim checkout.session.completed accepted', simFinRes.status === 200);
+  await sleep(1500); // give any (wrong) finalizer a chance to misfire
+  const simRunAfter = await mclient.db().collection('runs').findOne({ _id: 'run_hardening_simfin' });
+  ok('simulated run is NOT completed by the webhook finalizer', simRunAfter?.status === 'running', `status=${simRunAfter?.status}`);
+  await mclient.db().collection('runs').deleteOne({ _id: 'run_hardening_livefin' });
+  await mclient.db().collection('runs').deleteOne({ _id: 'run_hardening_simfin' });
+  await mclient.db().collection('subscriptions').deleteOne({ subscriptionId: 'sub_test_hardening_livefin' });
+  await mclient.db().collection('customers').deleteOne({ customerId: 'cus_test_hardening_livefin' });
+
   await mclient.close();
 
   console.log(`\n${'─'.repeat(60)}`);

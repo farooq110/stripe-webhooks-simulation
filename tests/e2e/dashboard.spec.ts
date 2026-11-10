@@ -15,6 +15,12 @@ test.describe.serial('StripePulse dashboard', () => {
   let runCounter = 0;
 
   test.beforeAll(async () => {
+    // Warm up the routes the first scenario touches: on a cold server the
+    // checkout scenario used to flake on first-compile latency (QA Round-3
+    // LOW-NEW-2T). Run one full sim checkout, then reset to a clean slate.
+    await api('/api/demo/reset', 'POST');
+    const warm = (await api('/api/demo/checkout', 'POST', {})) as { runId?: string };
+    if (warm?.runId) await api('/api/demo/checkout/confirm', 'POST', { runId: warm.runId });
     await api('/api/demo/reset', 'POST');
   });
 
@@ -54,11 +60,12 @@ test.describe.serial('StripePulse dashboard', () => {
     await expect(terminal).toContainText('/api/webhooks/stripe');
     await expect(terminal).toContainText('200');
 
-    // Timeline fully green
+    // Timeline fully green. The timeline renders from the run-state poll,
+    // which can be one beat behind the run badge — so this must retry, not
+    // read the count once (QA Round-3 LOW-NEW-2T first-run flake).
     const segments = page.getByTestId('timeline-strip').locator('[data-status="completed"]');
     await expect(segments.first()).toBeVisible();
-    const pendingCount = await page.getByTestId('timeline-strip').locator('[data-status="pending"]').count();
-    expect(pendingCount).toBe(0);
+    await expect(page.getByTestId('timeline-strip').locator('[data-status="pending"]')).toHaveCount(0, { timeout: 15_000 });
   });
 
   test('auto mode plays the run and finishes at the last step', async ({ page }) => {

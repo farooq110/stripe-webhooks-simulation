@@ -273,6 +273,51 @@ async function testGatewayMode(client) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+async function testResetProtectsLiveRuns(client) {
+  console.log('\n■ Reset protection in live mode (QA MEDIUM-NEW-1)');
+
+  // Live-gateway records must survive a reset; only simulated demo data goes.
+  // Regression for the Round-3 defect: runs were wiped because the filter
+  // keyed on a field run documents do not have.
+  const toLive = await api('POST', '/api/gateway/mode', { mode: 'live' });
+  ok('switch to live for the reset test', toLive.status === 200 && toLive.json?.mode === 'live');
+
+  const db = client.db();
+  const createdAt = new Date().toISOString();
+  await db.collection('runs').insertMany([
+    { _id: 'run_qa_protect_live', scenario: 'checkout_success', mode: 'live', status: 'completed', planId: 'price_pro_monthly', planName: 'Pro', amount: 1900, currency: 'usd', customerEmail: 'protect@stripepulse.dev', customerName: 'Protect Live', createdAt },
+    { _id: 'run_qa_protect_sim', scenario: 'checkout_success', mode: 'simulated', status: 'completed', planId: 'price_pro_monthly', planName: 'Pro', amount: 1900, currency: 'usd', customerEmail: 'protect@stripepulse.dev', customerName: 'Protect Sim', createdAt },
+  ]);
+  await db.collection('subscriptions').insertOne({
+    _id: 'sub_qa_protect', subscriptionId: 'sub_qa_protect', runId: 'run_qa_protect_live',
+    status: 'active', planId: 'price_pro_monthly', planName: 'Pro', amount: 1900, currency: 'usd',
+    customerId: 'cus_qa_protect', customerEmail: 'protect@stripepulse.dev',
+    createdAt, currentPeriodEnd: createdAt,
+  });
+
+  const preview = await api('GET', '/api/demo/reset');
+  ok('live preview counts only the sim run as deletable', preview.json?.counts?.runs === 1, JSON.stringify(preview.json?.counts));
+  ok('live preview reports protection on', preview.json?.protectedLiveRecords === true && preview.json?.liveRunsPreserved === 1);
+
+  const reset = await api('POST', '/api/demo/reset');
+  ok('live reset 200', reset.status === 200, `got ${reset.status}`);
+  ok('live reset deletes exactly the sim run', reset.json?.deleted?.runs === 1, JSON.stringify(reset.json?.deleted));
+  ok('live-gateway run survived reset', Boolean(await db.collection('runs').findOne({ _id: 'run_qa_protect_live' })));
+  ok('simulated run was wiped', (await db.collection('runs').findOne({ _id: 'run_qa_protect_sim' })) === null);
+  ok('rows belonging to the live run survived', Boolean(await db.collection('subscriptions').findOne({ subscriptionId: 'sub_qa_protect' })));
+  ok('reset note honestly reports preservation', /preserved/.test(reset.json?.note ?? '') && reset.json?.liveRunsPreserved === 1, reset.json?.note);
+
+  // Restore without a second reset — the reset bucket allows 5/min.
+  await api('POST', '/api/gateway/mode', { mode: 'simulated' });
+  await db.collection('runs').deleteOne({ _id: 'run_qa_protect_live' });
+  await db.collection('subscriptions').deleteOne({ subscriptionId: 'sub_qa_protect' });
+  await db.collection('customers').deleteMany({ customerId: 'cus_qa_protect' });
+  const restored = await api('GET', '/api/gateway/mode');
+  ok('gateway restored to simulated', restored.json?.mode === 'simulated');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function main() {
   const client = await mongo();
   const t0 = Date.now();
@@ -284,7 +329,8 @@ async function main() {
     await testPaymentRetry(client);
     await testDbFailure(client);
     await testReset(client);
-    await testGatewayMode(client); // runs last: flips the global gateway mode
+    await testGatewayMode(client); // runs last-ish: flips the global gateway mode
+    await testResetProtectsLiveRuns(client); // needs the mode API, restores simulated
   } finally {
     await client.close();
   }

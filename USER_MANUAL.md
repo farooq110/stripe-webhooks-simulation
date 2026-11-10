@@ -100,6 +100,8 @@ The right side shows the two tables that matter for subscription state:
 - **Subscriptions** — one row per subscription: customer, plan, status (`trialing`, `active`, `past_due`, `unpaid`, `canceled`), current period, and a **Cancel** button for live subscriptions. Status changes are the visible result of the webhook transactions.
 - **Payment attempts** — one row per charge attempt, successful or not, with the decline reason when there is one. In the retry scenario you'll see attempt #1 with `card_declined` and attempt #2 succeeded.
 
+In Live Mode the Cancel button is disabled and relabeled **Cancel (Stripe side)** — the demo cancel emits a simulated event, and live mode refuses those by design (signature separation). Cancel the subscription in your Stripe dashboard instead; reconciliation will pick the change up.
+
 ## 7. Run history
 
 Every scenario start creates a run with a status (`running`, `completed`, `failed`). The history list in the left rail lets you switch between runs; the pipeline, timeline and terminal all follow the selected run. Events produced by one scenario can belong to an earlier run (the duplicate scenario redelivers an event from a previous run on purpose) — the terminal shows which run each event belongs to.

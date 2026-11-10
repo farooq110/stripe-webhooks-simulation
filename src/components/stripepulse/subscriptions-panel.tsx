@@ -41,6 +41,11 @@ export function SubscriptionsPanel({
     ? run.subscriptions
     : appState?.subscriptions ?? [];
   const currentStatus = subs[0]?.status;
+  // In live mode the demo cancel emits a sim-signed event, which the webhook
+  // endpoint refuses by design (cross-mode signature separation). Disable the
+  // control with an honest hint instead of letting the operator hit a
+  // guaranteed failure (QA Round-3 INFO).
+  const liveMode = appState?.gateway.mode === 'live';
 
   const cancel = async (subscriptionId: string) => {
     setCanceling(subscriptionId);
@@ -135,12 +140,17 @@ export function SubscriptionsPanel({
                     size="sm"
                     variant="ghost"
                     className="h-7 shrink-0 px-2 text-[10px] text-muted-foreground hover:text-rose-500"
-                    disabled={canceling !== null}
+                    disabled={canceling !== null || liveMode}
+                    title={
+                      liveMode
+                        ? 'Live mode: cancel the subscription on the Stripe side — simulated cancel events are refused here.'
+                        : undefined
+                    }
                     onClick={() => void cancel(s.subscriptionId)}
                     data-testid={`cancel-sub-${s.subscriptionId}`}
                   >
                     <X className="h-3 w-3" />
-                    {canceling === s.subscriptionId ? 'Canceling…' : 'Cancel'}
+                    {canceling === s.subscriptionId ? 'Canceling…' : liveMode ? 'Cancel (Stripe side)' : 'Cancel'}
                   </Button>
                 )}
               </CardContent>
